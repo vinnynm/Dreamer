@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    ic_default_album_art.xml
+    Default album artwork shown when a song has no embedded or sidecar art.
+    Design: simplified vinyl record with a label circle and grooves.
+    Safe to use as notification largeIcon (converts cleanly to Bitmap).
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="256"
+    android:viewportHeight="256"
+    android:tint="#333333"
+    android:alpha="0.6">
+
+    <!-- Outer disc — deep charcoal -->
+    <path
+        android:pathData="M128,8 A120,120 0 1,1 127.999,8 Z"
+        android:fillColor="#1A1A1A" />
+
+    <!-- Groove ring 1 -->
+    <path
+        android:pathData="M128,24 A104,104 0 1,1 127.999,24 Z"
+        android:fillColor="#222222" />
+
+    <!-- Groove ring 2 -->
+    <path
+        android:pathData="M128,38 A90,90 0 1,1 127.999,38 Z"
+        android:fillColor="#1E1E1E" />
+
+    <!-- Groove ring 3 -->
+    <path
+        android:pathData="M128,52 A76,76 0 1,1 127.999,52 Z"
+        android:fillColor="#242424" />
+
+    <!-- Groove ring 4 -->
+    <path
+        android:pathData="M128,66 A62,62 0 1,1 127.999,66 Z"
+        android:fillColor="#1E1E1E" />
+
+    <!-- Label area — amber gradient approximated with solid + lighter circle -->
+    <path
+        android:pathData="M128,80 A48,48 0 1,1 127.999,80 Z"
+        android:fillColor="#7A5500" />
+
+    <!-- Label highlight -->
+    <path
+        android:pathData="M128,88 A40,40 0 1,1 127.999,88 Z"
+        android:fillColor="#8A6200" />
+
+    <!-- Music note icon centred on label -->
+    <!-- Stem -->
+    <path
+        android:pathData="M132,108 L132,122 L124,125 L124,118 Z"
+        android:fillColor="#FFB300" />
+    <!-- Flag -->
+    <path
+        android:pathData="M132,108 L140,111 L140,104 L132,108 Z"
+        android:fillColor="#FFB300" />
+    <!-- Note head -->
+    <path
+        android:pathData="M124,125 A5,4 0 1,0 123.999,125 Z"
+        android:fillColor="#FFB300" />
+
+    <!-- Centre spindle hole -->
+    <path
+        android:pathData="M128,120 A8,8 0 1,1 127.999,120 Z"
+        android:fillColor="#0D0D0D" />
+
+    <!-- Reflection sheen — top-left arc, low opacity white -->
+    <path
+        android:pathData="M60,60 A88,88 0 0,1 128,40"
+        android:strokeColor="#33FFFFFF"
+        android:strokeWidth="6"
+        android:fillColor="#00000000"
+        android:strokeLineCap="round" />
+
+</vector>

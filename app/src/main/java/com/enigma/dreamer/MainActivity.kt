@@ -1,0 +1,274 @@
+package com.enigma.dreamer
+
+import android.Manifest
+import android.content.Intent
+import android.os.Build
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
+import androidx.compose.animation.*
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import androidx.core.view.WindowCompat
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.rememberNavController
+import androidx.navigation.toRoute
+import com.enigma.dreamer.core.MusicUiState
+import kotlinx.serialization.Serializable
+import com.enigma.dreamer.ui.screens.LibraryScreen
+import com.enigma.dreamer.ui.screens.NowPlayingScreen
+import com.enigma.dreamer.ui.screens.PlaylistDetailScreen
+import com.enigma.dreamer.ui.screens.SettingsScreen
+import com.enigma.dreamer.ui.theme.Amber
+import com.enigma.dreamer.ui.theme.*
+import com.enigma.dreamer.ui.theme.Amoled
+import com.enigma.dreamer.ui.theme.DreamerTheme
+import com.enigma.dreamer.ui.theme.ErrorRed
+import com.enigma.dreamer.ui.theme.TextSecondary
+import com.enigma.dreamer.viewmodel.MusicViewModel
+
+class MainActivity : ComponentActivity() {
+
+    private val viewModel: MusicViewModel by viewModels()
+
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { /* state reloads via ViewModel */ }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        requestPermissions()
+        setContent {
+            DreamerTheme {
+                DevLyricApp(
+                    viewModel     = viewModel,
+                    openNowPlaying = intent?.getBooleanExtra("open_now_playing", false) == true
+                )
+            }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        // Notification tap lands here when activity is already running
+        if (intent.getBooleanExtra("open_now_playing", false)) {
+            // The Compose state is owned by DevLyricApp; signal via a shared flag
+            setIntent(intent)
+        }
+    }
+
+    private fun requestPermissions() {
+        val perms = buildList {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                add(Manifest.permission.READ_MEDIA_AUDIO)
+                add(Manifest.permission.POST_NOTIFICATIONS)
+            } else {
+                add(Manifest.permission.READ_EXTERNAL_STORAGE)
+            }
+            add(Manifest.permission.FOREGROUND_SERVICE)
+            add(Manifest.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK)
+        }
+        permissionLauncher.launch(perms.toTypedArray())
+    }
+}
+
+// ── Navigation ────────────────────────────────────────────────────────────────
+
+@Serializable object LibraryRoute
+@Serializable object NowPlayingRoute
+@Serializable object SettingsRoute
+@Serializable data class PlaylistDetailRoute(val playlistId: Long)
+
+@Composable
+fun DevLyricApp(viewModel: MusicViewModel, openNowPlaying: Boolean = false) {
+    val uiState by viewModel.uiState.collectAsState()
+    val navController = rememberNavController()
+
+    // Handle notification tap while app is already open (onNewIntent path)
+    LaunchedEffect(openNowPlaying) {
+        if (openNowPlaying) {
+            navController.navigate(NowPlayingRoute) {
+                launchSingleTop = true
+            }
+        }
+    }
+
+    when (val state = uiState) {
+        is MusicUiState.Loading -> LoadingScreen()
+        is MusicUiState.Error   -> ErrorScreen(state.message) { /* retry handled by VM */ }
+        is MusicUiState.Ready   -> {
+            val ps = state.playbackState
+            val snackbarHostState = remember { SnackbarHostState() }
+            
+            LaunchedEffect(ps.error) {
+                ps.error?.let {
+                    snackbarHostState.showSnackbar(it)
+                    viewModel.clearError()
+                }
+            }
+
+            Box(Modifier.fillMaxSize()) {
+                NavHost(
+                    navController = navController,
+                    startDestination = if (openNowPlaying) NowPlayingRoute else LibraryRoute,
+                    enterTransition = { fadeIn() + slideInVertically { it / 4 } },
+                    exitTransition = { fadeOut() + slideOutVertically { -it / 4 } }
+                ) {
+                    composable<LibraryRoute> {
+                        LibraryScreen(
+                            songs              = state.songs,
+                            filteredSongs      = state.filteredSongs,
+                            playlists          = state.playlists,
+                            searchQuery        = state.searchQuery,
+                            sortOrder          = state.sortOrder,
+                            currentSong        = ps.currentSong,
+                            isPlaying          = ps.isPlaying,
+                            playbackProgress   = ps.progress,
+                            onSongClick        = { song ->
+                                viewModel.playSong(song, state.filteredSongs)
+                                navController.navigate(NowPlayingRoute)
+                            },
+                            onPlaylistClick    = { pl ->
+                                navController.navigate(PlaylistDetailRoute(pl.id))
+                            },
+                            onSearch           = viewModel::search,
+                            onSortChange       = viewModel::setSortOrder,
+                            onCreatePlaylist   = { name -> viewModel.createPlaylist(name) },
+                            onDeletePlaylist   = viewModel::deletePlaylist,
+                            onRenamePlaylist   = viewModel::renamePlaylist,
+                            onAddSongToPlaylist= viewModel::addSongToPlaylist,
+                            onToggleFavorite   = viewModel::toggleFavorite,
+                            onPlayNext         = viewModel::playNext,
+                            onAddToQueue       = viewModel::addToQueue,
+                            onPlayFavorites    = {
+                                val favs = state.songs.filter { it.isFavorite }
+                                if (favs.isNotEmpty()) {
+                                    viewModel.playSong(favs.first(), favs)
+                                    navController.navigate(NowPlayingRoute)
+                                }
+                            },
+                            onMiniPlayerClick  = { navController.navigate(NowPlayingRoute) },
+                            onMiniPlayPause    = viewModel::togglePlayPause,
+                            onMiniNext         = viewModel::next
+                        )
+                    }
+
+                    composable<NowPlayingRoute> {
+                        NowPlayingScreen(
+                            playbackState    = ps,
+                            currentLyricLine = state.currentLyricLine,
+                            showLyrics       = state.showLyrics,
+                            showQueue        = state.showQueue,
+                            dominantColor    = state.dominantColor,
+                            accentTextColor  = state.accentTextColor,
+                            onPlayPause      = viewModel::togglePlayPause,
+                            onNext           = viewModel::next,
+                            onPrevious       = viewModel::previous,
+                            onSeek           = viewModel::seekTo,
+                            onToggleRepeat   = viewModel::toggleRepeat,
+                            onToggleShuffle  = viewModel::toggleShuffle,
+                            onToggleLyrics   = viewModel::toggleLyrics,
+                            onToggleFavorite = { ps.currentSong?.let { viewModel.toggleFavorite(it) } },
+                            onToggleQueue    = viewModel::toggleQueueView,
+                            onSpeedChange    = viewModel::setPlaybackSpeed,
+                            onOpenSettings   = { navController.navigate(SettingsRoute) },
+                            onSkipToQueue    = viewModel::skipToQueueItem,
+                            onBack           = { navController.popBackStack() }
+                        )
+                    }
+
+                    composable<SettingsRoute> {
+                        SettingsScreen(
+                            playbackSpeed = ps.playbackSpeed,
+                            sortOrder = state.sortOrder,
+                            sleepTimer = ps.sleepTimer,
+                            onSpeedChange = viewModel::setPlaybackSpeed,
+                            onSortChange = viewModel::setSortOrder,
+                            onStartSleepTimer = viewModel::startSleepTimer,
+                            onCancelSleepTimer = viewModel::cancelSleepTimer,
+                            onBack = { navController.popBackStack() }
+                        )
+                    }
+
+                    composable<PlaylistDetailRoute> { backStackEntry ->
+                        val route: PlaylistDetailRoute = backStackEntry.toRoute()
+                        val playlist = state.playlists.find { it.id == route.playlistId }
+                        if (playlist != null) {
+                            val playlistSongs = playlist.songIds.mapNotNull { id ->
+                                state.songs.find { it.id == id }
+                            }
+                            PlaylistDetailScreen(
+                                playlist    = playlist,
+                                songs       = playlistSongs,
+                                currentSong = ps.currentSong,
+                                isPlaying   = ps.isPlaying,
+                                onSongClick = { song ->
+                                    viewModel.playSong(song, playlistSongs)
+                                    navController.navigate(NowPlayingRoute)
+                                },
+                                onRemoveSong = { song ->
+                                    viewModel.removeSongFromPlaylist(song, playlist.id)
+                                },
+                                onPlayAll    = {
+                                    viewModel.playPlaylist(playlist)
+                                    navController.navigate(NowPlayingRoute)
+                                },
+                                onBack       = { navController.popBackStack() }
+                            )
+                        } else {
+                            navController.popBackStack()
+                        }
+                    }
+                }
+
+                SnackbarHost(
+                    hostState = snackbarHostState,
+                    modifier  = Modifier
+                        .align(Alignment.BottomCenter)
+                        .navigationBarsPadding()
+                        .padding(bottom = 80.dp)
+                )
+            }
+        }
+    }
+}
+
+// ── Loading / Error ───────────────────────────────────────────────────────────
+
+@Composable
+private fun LoadingScreen() {
+    Box(Modifier.fillMaxSize().background(Amoled), contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            CircularProgressIndicator(color = Amber, strokeWidth = 3.dp)
+            Spacer(Modifier.height(16.dp))
+            Text("Loading your music…", color = TextSecondary,
+                style = MaterialTheme.typography.bodyMedium)
+        }
+    }
+}
+
+@Composable
+private fun ErrorScreen(message: String, onRetry: () -> Unit) {
+    Box(Modifier.fillMaxSize().background(Amoled), contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Icon(Icons.Filled.ErrorOutline, null, tint = ErrorRed, modifier = Modifier.size(64.dp))
+            Spacer(Modifier.height(12.dp))
+            Text(message, color = TextSecondary, style = MaterialTheme.typography.bodyMedium)
+            Spacer(Modifier.height(16.dp))
+            Button(onClick = onRetry, colors = ButtonDefaults.buttonColors(containerColor = Amber)) {
+                Text("Retry", color = Amoled)
+            }
+        }
+    }
+}

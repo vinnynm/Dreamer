@@ -1,0 +1,92 @@
+package com.enigma.dreamer.core
+
+import android.net.Uri
+import com.enigma.devlyric.core.LyricDocument
+
+
+data class Song(
+    val id: Long,
+    val title: String,
+    val artist: String,
+    val album: String,
+    val duration: Long,          // ms
+    val uri: Uri,
+    val albumArtUri: Uri? = null,
+    val lyricDocument: LyricDocument? = null,
+    val isFavorite: Boolean = false,
+    val year: Int = 0,
+    val trackNumber: Int = 0,
+    val filePath: String = "",
+    val fileSize: Long = 0L,
+    val mimeType: String = ""
+)
+
+data class Playlist(
+    val id: Long,
+    val name: String,
+    val songIds: List<Long?> = emptyList(),
+    val createdAt: Long = System.currentTimeMillis()
+)
+
+enum class RepeatMode  { NONE, ONE, ALL }
+enum class ShuffleMode { OFF, ON }
+
+/** How songs are ordered in the library list. */
+enum class SortOrder {
+    TITLE_ASC, TITLE_DESC,
+    ARTIST_ASC, ARTIST_DESC,
+    ALBUM_ASC,
+    DURATION_ASC, DURATION_DESC,
+    DATE_ADDED_DESC,
+    FAVORITES_FIRST
+}
+
+/** Granular player state including the async prepare window. */
+enum class BufferingState { IDLE, PREPARING, READY, ERROR }
+
+/** Sleep-timer state. */
+data class SleepTimer(
+    val isActive: Boolean = false,
+    val endsAtMs: Long = 0L        // System.currentTimeMillis() + delay
+) {
+    val remainingMs: Long get() = (endsAtMs - System.currentTimeMillis()).coerceAtLeast(0L)
+}
+
+data class PlaybackState(
+    val currentSong: Song? = null,
+    val isPlaying: Boolean = false,
+    val positionMs: Long = 0L,
+    val durationMs: Long = 0L,
+    val repeatMode: RepeatMode = RepeatMode.NONE,
+    val shuffleMode: ShuffleMode = ShuffleMode.OFF,
+    val currentPlaylistId: Long? = null,
+    val queue: List<Song> = emptyList(),
+    val queueIndex: Int = 0,
+    val bufferingState: BufferingState = BufferingState.IDLE,
+    val playbackSpeed: Float = 1.0f,
+    val sleepTimer: SleepTimer = SleepTimer(),
+    val error: String? = null
+) {
+    val progress: Float   get() = if (durationMs > 0) positionMs.toFloat() / durationMs else 0f
+    val hasNext: Boolean  get() = queueIndex < queue.size - 1 || repeatMode == RepeatMode.ALL
+    val hasPrevious: Boolean get() = queueIndex > 0 || repeatMode == RepeatMode.ALL
+    val isPreparing: Boolean get() = bufferingState == BufferingState.PREPARING
+}
+
+sealed class MusicUiState {
+    object Loading : MusicUiState()
+    data class Ready(
+        val songs: List<Song> = emptyList(),
+        val playlists: List<Playlist> = emptyList(),
+        val filteredSongs: List<Song> = emptyList(),
+        val searchQuery: String = "",
+        val sortOrder: SortOrder = SortOrder.TITLE_ASC,
+        val playbackState: PlaybackState = PlaybackState(),
+        val currentLyricLine: Int = -1,
+        val showLyrics: Boolean = false,
+        val showQueue: Boolean = false,
+        val dominantColor: Int = 0xFF0D0D0D.toInt(),
+        val accentTextColor: Int = 0xFFEEEEEE.toInt()
+    ) : MusicUiState()
+    data class Error(val message: String) : MusicUiState()
+}
