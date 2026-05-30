@@ -8,7 +8,7 @@ import kotlinx.coroutines.flow.Flow
 
 @Entity(tableName = "playlists")
 data class PlaylistEntity(
-    @PrimaryKey val id: Long,
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,  // was manual timestamp — collision risk fixed
     val name: String,
     val createdAt: Long = System.currentTimeMillis()
 )
@@ -17,16 +17,16 @@ data class PlaylistEntity(
     tableName = "playlist_songs",
     primaryKeys = ["playlistId", "songId"],
     foreignKeys = [ForeignKey(
-        entity       = PlaylistEntity::class,
-        parentColumns= ["id"],
-        childColumns = ["playlistId"],
-        onDelete     = ForeignKey.CASCADE
+        entity        = PlaylistEntity::class,
+        parentColumns = ["id"],
+        childColumns  = ["playlistId"],
+        onDelete      = ForeignKey.CASCADE
     )],
     indices = [Index("playlistId"), Index("songId")]
 )
 data class PlaylistSongCrossRef(
     val playlistId: Long,
-    val songId: Long,
+    val songId: Long,           // non-nullable — a cross-ref row without a songId is meaningless
     val position: Int = 0
 )
 
@@ -38,15 +38,11 @@ data class FavoriteEntity(
 
 // ── Flat result type for batch playlist+song-id query (eliminates N+1) ────────
 
-/**
- * Result row from the single JOIN query that loads all playlists with their
- * song IDs in one database round-trip instead of N+1.
- */
 data class PlaylistWithSongIds(
     val playlistId: Long,
     val name: String,
     val createdAt: Long,
-    val songId: Long?,       // nullable — playlist may have 0 songs
+    val songId: Long?,      // nullable here only — LEFT JOIN may produce null for empty playlists
     val position: Int?
 ) {
     fun toPlaylistEntity() = PlaylistEntity(playlistId, name, createdAt)
@@ -57,7 +53,6 @@ data class PlaylistWithSongIds(
 @Dao
 interface PlaylistDao {
 
-    // Single JOIN query — one DB round-trip for ALL playlists + their song IDs.
     @Query("""
         SELECT p.id AS playlistId, p.name, p.createdAt, ps.songId, ps.position
         FROM playlists p
@@ -74,11 +69,8 @@ interface PlaylistDao {
     """)
     suspend fun getAllWithSongIds(): List<PlaylistWithSongIds>
 
-    @Query("SELECT * FROM playlists ORDER BY createdAt DESC")
-    fun observeAll(): Flow<List<PlaylistEntity>>
-
     @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insertPlaylist(playlist: PlaylistEntity): Long
+    suspend fun insertPlaylist(playlist: PlaylistEntity): Long  // returns generated id
 
     @Update
     suspend fun updatePlaylist(playlist: PlaylistEntity): Int
@@ -119,7 +111,8 @@ interface FavoriteDao {
 
     @Transaction
     suspend fun toggle(songId: Long) {
-        if (isFavorite(songId)) removeFavorite(songId) else addFavorite(FavoriteEntity(songId))
+        if (isFavorite(songId)) removeFavorite(songId)
+        else addFavorite(FavoriteEntity(songId))
     }
 }
 
@@ -127,7 +120,7 @@ interface FavoriteDao {
 
 @Database(
     entities     = [PlaylistEntity::class, PlaylistSongCrossRef::class, FavoriteEntity::class],
-    version      = 1,
+    version      = 2,   // bumped for schema change (autoGenerate on playlists)
     exportSchema = false
 )
 abstract class DevLyricDatabase : RoomDatabase() {
@@ -137,13 +130,16 @@ abstract class DevLyricDatabase : RoomDatabase() {
     companion object {
         @Volatile private var INSTANCE: DevLyricDatabase? = null
 
-        fun getInstance(context: android.content.Context): DevLyricDatabase =
+        fun getInstance(context: Context): DevLyricDatabase =
             INSTANCE ?: synchronized(this) {
                 INSTANCE ?: Room.databaseBuilder(
                     context.applicationContext,
                     DevLyricDatabase::class.java,
                     "devlyric.db"
-                ).build().also { INSTANCE = it }
+                )
+                    .fallbackToDestructiveMigration()   // v1→v2: schema change, existing data cleared
+                    .build()
+                    .also { INSTANCE = it }
             }
     }
 }

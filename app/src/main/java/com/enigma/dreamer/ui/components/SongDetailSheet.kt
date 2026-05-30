@@ -16,14 +16,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
-import com.enigma.devlyric.core.*
 import com.enigma.dreamer.core.Playlist
 import com.enigma.dreamer.core.Song
 import com.enigma.dreamer.ui.theme.*
 
 /**
- * Bottom sheet showing full song metadata and quick-action buttons:
- * Play Next, Add to Queue, Add to Playlist, Toggle Favourite, Embed Lyrics.
+ * Bottom sheet showing full song metadata and quick-action buttons.
+ * Now includes "Edit Lyrics" which opens the LyricEditorScreen.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -34,12 +33,13 @@ fun SongDetailSheet(
     onPlayNext: () -> Unit,
     onAddToQueue: () -> Unit,
     onAddToPlaylist: (Playlist) -> Unit,
-    onToggleFavorite: () -> Unit
+    onToggleFavorite: () -> Unit,
+    onEditLyrics: () -> Unit          // NEW
 ) {
     ModalBottomSheet(
-        onDismissRequest  = onDismiss,
-        containerColor    = Surface2,
-        dragHandle        = { BottomSheetDefaults.DragHandle(color = TextMuted) }
+        onDismissRequest = onDismiss,
+        containerColor   = Surface2,
+        dragHandle       = { BottomSheetDefaults.DragHandle(color = TextMuted) }
     ) {
         Column(
             modifier = Modifier
@@ -51,12 +51,12 @@ fun SongDetailSheet(
         ) {
             // Song identity
             Row(
-                verticalAlignment = Alignment.CenterVertically,
+                verticalAlignment     = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(14.dp)
             ) {
                 AlbumArtwork(song, size = 64.dp)
                 Column(modifier = Modifier.weight(1f)) {
-                    Text(song.title, style = MaterialTheme.typography.titleMedium, color = TextPrimary)
+                    Text(song.title,  style = MaterialTheme.typography.titleMedium, color = TextPrimary)
                     Text(song.artist, style = MaterialTheme.typography.bodySmall)
                     Text(song.album,  style = MaterialTheme.typography.bodySmall, color = TextMuted)
                 }
@@ -64,17 +64,24 @@ fun SongDetailSheet(
 
             HorizontalDivider(color = Surface3)
 
-            // Quick actions
             Text("Actions", style = MaterialTheme.typography.labelSmall,
                 color = TextMuted, modifier = Modifier.padding(top = 4.dp))
 
-            ActionRow(Icons.Filled.QueuePlayNext, "Play Next",        onPlayNext)
-            ActionRow(Icons.Filled.AddToQueue,    "Add to Queue",     onAddToQueue)
+            ActionRow(Icons.Filled.QueuePlayNext, "Play Next",    onPlayNext)
+            ActionRow(Icons.Filled.AddToQueue,    "Add to Queue", onAddToQueue)
             ActionRow(
                 if (song.isFavorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
                 if (song.isFavorite) "Remove from Favourites" else "Add to Favourites",
                 onToggleFavorite,
                 tint = if (song.isFavorite) Amber else TextPrimary
+            )
+
+            // Edit lyrics action — always shown; label adapts to whether lyrics exist
+            ActionRow(
+                icon    = Icons.Filled.Edit,
+                label   = if (song.lyricDocument != null) "Edit Lyrics" else "Add Lyrics",
+                onClick = onEditLyrics,
+                tint    = Amber
             )
 
             if (playlists.isNotEmpty()) {
@@ -88,9 +95,7 @@ fun SongDetailSheet(
 
             HorizontalDivider(color = Surface3)
 
-            // Metadata grid
-            Text("Info", style = MaterialTheme.typography.labelSmall,
-                color = TextMuted)
+            Text("Info", style = MaterialTheme.typography.labelSmall, color = TextMuted)
             MetaGrid(song)
         }
     }
@@ -107,11 +112,9 @@ private fun ActionRow(
         modifier = Modifier
             .fillMaxWidth()
             .background(Surface3, RoundedCornerShape(10.dp))
-            .padding(horizontal = 16.dp, vertical = 14.dp)
-            .then(
-                Modifier.clickable(onClick = onClick)   // uses extension from foundation
-            ),
-        verticalAlignment = Alignment.CenterVertically,
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment     = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         Icon(icon, contentDescription = label, tint = tint, modifier = Modifier.size(20.dp))
@@ -129,13 +132,14 @@ private fun MetaGrid(song: Song) {
         "Track"      to if (song.trackNumber > 0) song.trackNumber.toString() else "—",
         "Format"     to song.mimeType.substringAfterLast('/').uppercase().ifBlank { "—" },
         "File size"  to formatFileSize(song.fileSize),
-        "Has lyrics" to if (song.lyricDocument != null) "Yes (${song.lyricDocument.lines.size} lines)" else "No",
+        "Has lyrics" to if (song.lyricDocument != null)
+            "Yes (${song.lyricDocument.lines.size} lines)" else "No",
         "Path"       to song.filePath.substringAfterLast('/')
     )
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         rows.forEach { (label, value) ->
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier              = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Text(label, style = MaterialTheme.typography.bodySmall, color = TextMuted,
@@ -148,10 +152,8 @@ private fun MetaGrid(song: Song) {
 }
 
 private fun formatFileSize(bytes: Long): String = when {
-    bytes <= 0      -> "—"
-    bytes < 1024    -> "$bytes B"
-    bytes < 1024*1024 -> "%.1f KB".format(bytes / 1024f)
-    else            -> "%.1f MB".format(bytes / (1024f * 1024f))
+    bytes <= 0          -> "—"
+    bytes < 1024        -> "$bytes B"
+    bytes < 1024 * 1024 -> "%.1f KB".format(bytes / 1024f)
+    else                -> "%.1f MB".format(bytes / (1024f * 1024f))
 }
-
-

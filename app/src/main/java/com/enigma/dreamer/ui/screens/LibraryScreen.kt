@@ -7,6 +7,7 @@ import androidx.compose.foundation.lazy.*
 import androidx.compose.foundation.shape.*
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
@@ -25,15 +26,7 @@ import com.enigma.dreamer.core.SortOrder
 import com.enigma.dreamer.ui.components.MiniPlayer
 import com.enigma.dreamer.ui.components.SongDetailSheet
 import com.enigma.dreamer.ui.components.SongListItem
-import com.enigma.dreamer.ui.theme.Amber
-import com.enigma.dreamer.ui.theme.AmberDim
-import com.enigma.dreamer.ui.theme.Amoled
-import com.enigma.dreamer.ui.theme.ErrorRed
-import com.enigma.dreamer.ui.theme.Surface2
-import com.enigma.dreamer.ui.theme.Surface3
-import com.enigma.dreamer.ui.theme.TextMuted
-import com.enigma.dreamer.ui.theme.TextPrimary
-import com.enigma.dreamer.ui.theme.TextSecondary
+import com.enigma.dreamer.ui.theme.*
 
 private val TABS = listOf("Songs", "Favourites", "Playlists")
 
@@ -59,17 +52,17 @@ fun LibraryScreen(
     onToggleFavorite: (Song) -> Unit,
     onPlayNext: (Song) -> Unit,
     onAddToQueue: (Song) -> Unit,
+    onEditLyrics: (Song) -> Unit,         // NEW
     onPlayFavorites: () -> Unit,
     onMiniPlayerClick: () -> Unit,
     onMiniPlayPause: () -> Unit,
     onMiniNext: () -> Unit
 ) {
-    var selectedTab by remember { mutableIntStateOf(0) }
-    var showCreatePlaylistDialog by remember { mutableStateOf(false) }
-    var newPlaylistName by remember { mutableStateOf("") }
-    var showSortSheet by remember { mutableStateOf(false) }
-    // Song for the detail bottom sheet (long-press / ⋮)
-    var detailSong by remember { mutableStateOf<Song?>(null) }
+    var selectedTab               by remember { mutableIntStateOf(0) }
+    var showCreatePlaylistDialog  by remember { mutableStateOf(false) }
+    var newPlaylistName           by remember { mutableStateOf("") }
+    var showSortSheet             by remember { mutableStateOf(false) }
+    var detailSong                by remember { mutableStateOf<Song?>(null) }
 
     Scaffold(
         containerColor = Amoled,
@@ -81,14 +74,12 @@ fun LibraryScreen(
                     .padding(horizontal = 16.dp)
             ) {
                 Spacer(Modifier.height(16.dp))
-                // Title row
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier          = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text("DevLyric", style = MaterialTheme.typography.displayLarge,
                         color = Amber, modifier = Modifier.weight(1f))
-                    // Sort button (only on Songs tab)
                     if (selectedTab == 0) {
                         IconButton(onClick = { showSortSheet = true }) {
                             Icon(Icons.Filled.SortByAlpha, "Sort", tint = TextSecondary)
@@ -101,7 +92,6 @@ fun LibraryScreen(
                     }
                 }
                 Spacer(Modifier.height(12.dp))
-                // Search bar
                 OutlinedTextField(
                     value         = searchQuery,
                     onValueChange = onSearch,
@@ -115,17 +105,16 @@ fun LibraryScreen(
                     modifier      = Modifier.fillMaxWidth(),
                     shape         = RoundedCornerShape(16.dp),
                     colors        = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor    = Amber,
-                        unfocusedBorderColor  = Surface3,
+                        focusedBorderColor      = Amber,
+                        unfocusedBorderColor    = Surface3,
                         focusedContainerColor   = Surface2,
                         unfocusedContainerColor = Surface2,
-                        cursorColor           = Amber
+                        cursorColor             = Amber
                     ),
-                    singleLine    = true,
+                    singleLine      = true,
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search)
                 )
                 Spacer(Modifier.height(12.dp))
-                // Three tabs
                 TabRow(
                     selectedTabIndex = selectedTab,
                     containerColor   = Color.Transparent,
@@ -158,12 +147,12 @@ fun LibraryScreen(
             ) {
                 currentSong?.let { song ->
                     MiniPlayer(
-                        song = song,
-                        isPlaying = isPlaying,
-                        progress = playbackProgress,
+                        song        = song,
+                        isPlaying   = isPlaying,
+                        progress    = playbackProgress,
                         onPlayPause = onMiniPlayPause,
-                        onNext = onMiniNext,
-                        onClick = onMiniPlayerClick
+                        onNext      = onMiniNext,
+                        onClick     = onMiniPlayerClick
                     )
                 }
             }
@@ -180,14 +169,14 @@ fun LibraryScreen(
                 modifier         = Modifier.padding(padding)
             )
             1 -> FavoritesTab(
-                songs = songs,
-                currentSong = currentSong,
-                isPlaying = isPlaying,
-                onSongClick = onSongClick,
+                songs            = songs,
+                currentSong      = currentSong,
+                isPlaying        = isPlaying,
+                onSongClick      = onSongClick,
                 onToggleFavorite = onToggleFavorite,
-                onPlayAll = onPlayFavorites,
-                onLongClick = { detailSong = it },
-                modifier = Modifier.padding(padding)
+                onPlayAll        = onPlayFavorites,
+                onLongClick      = { detailSong = it },
+                modifier         = Modifier.padding(padding)
             )
             2 -> PlaylistsTab(
                 playlists        = playlists,
@@ -236,22 +225,23 @@ fun LibraryScreen(
     // ── Sort bottom sheet ─────────────────────────────────────────────────────
     if (showSortSheet) {
         SortBottomSheet(
-            current    = sortOrder,
-            onSelect   = { onSortChange(it); showSortSheet = false },
-            onDismiss  = { showSortSheet = false }
+            current   = sortOrder,
+            onSelect  = { onSortChange(it); showSortSheet = false },
+            onDismiss = { showSortSheet = false }
         )
     }
 
-    // ── Song detail sheet (long-press) ────────────────────────────────────────
+    // ── Song detail sheet ─────────────────────────────────────────────────────
     detailSong?.let { song ->
         SongDetailSheet(
-            song = song,
-            playlists = playlists,
-            onDismiss = { detailSong = null },
-            onPlayNext = { onPlayNext(song); detailSong = null },
-            onAddToQueue = { onAddToQueue(song); detailSong = null },
+            song            = song,
+            playlists       = playlists,
+            onDismiss       = { detailSong = null },
+            onPlayNext      = { onPlayNext(song);            detailSong = null },
+            onAddToQueue    = { onAddToQueue(song);          detailSong = null },
             onAddToPlaylist = { pl -> onAddSongToPlaylist(song, pl.id); detailSong = null },
-            onToggleFavorite = { onToggleFavorite(song); detailSong = null }
+            onToggleFavorite = { onToggleFavorite(song);    detailSong = null },
+            onEditLyrics    = { onEditLyrics(song);         detailSong = null }  // NEW
         )
     }
 }
@@ -286,13 +276,14 @@ private fun SortBottomSheet(
                         .background(if (current == order) AmberDim else Color.Transparent)
                         .clickable { onSelect(order) }
                         .padding(horizontal = 16.dp, vertical = 14.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+                    verticalAlignment     = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Icon(
                         if (current == order) Icons.Filled.RadioButtonChecked
                         else Icons.Filled.RadioButtonUnchecked,
-                        null, tint = if (current == order) Amber else TextMuted,
+                        null,
+                        tint     = if (current == order) Amber else TextMuted,
                         modifier = Modifier.size(18.dp)
                     )
                     Text(
@@ -342,12 +333,13 @@ fun SongsTab(
         return
     }
     LazyColumn(
-        modifier        = modifier.fillMaxSize(),
-        contentPadding  = PaddingValues(horizontal = 8.dp, vertical = 8.dp)
+        modifier       = modifier.fillMaxSize(),
+        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp)
     ) {
         item {
             Text("${songs.size} songs",
-                style = MaterialTheme.typography.bodySmall, color = TextMuted,
+                style    = MaterialTheme.typography.bodySmall,
+                color    = TextMuted,
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
         }
         items(songs, key = { it.id }) { song ->
@@ -355,17 +347,18 @@ fun SongsTab(
                 if (song.isFavorite) Amber else TextMuted, label = "fav${song.id}"
             )
             SongListItem(
-                song = song,
+                song      = song,
                 isPlaying = song.id == currentSong?.id && isPlaying,
-                onClick = { onSongClick(song) },
+                onClick   = { onSongClick(song) },
                 onLongClick = { onLongClick(song) },
                 trailingContent = {
                     IconButton(onClick = { onToggleFavorite(song) }) {
                         Icon(
                             if (song.isFavorite) Icons.Filled.Favorite
                             else Icons.Filled.FavoriteBorder,
-                            contentDescription = "Favourite",
-                            tint = favTint, modifier = Modifier.size(20.dp)
+                            "Favourite",
+                            tint     = favTint,
+                            modifier = Modifier.size(20.dp)
                         )
                     }
                 }
@@ -389,7 +382,7 @@ fun PlaylistsTab(
     if (playlists.isEmpty()) {
         Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Icon(Icons.Filled.QueueMusic, null, tint = TextMuted, modifier = Modifier.size(64.dp))
+                Icon(Icons.AutoMirrored.Filled.QueueMusic, null, tint = TextMuted, modifier = Modifier.size(64.dp))
                 Spacer(Modifier.height(12.dp))
                 Text("No playlists yet", color = TextMuted, style = MaterialTheme.typography.bodyLarge)
                 Text("Tap + to create one", color = TextMuted, style = MaterialTheme.typography.bodySmall)
@@ -439,12 +432,15 @@ fun PlaylistItem(
         Box(
             modifier         = Modifier.size(50.dp).clip(RoundedCornerShape(10.dp)).background(AmberDim),
             contentAlignment = Alignment.Center
-        ) { Icon(Icons.Filled.QueueMusic, null, tint = Amber, modifier = Modifier.size(28.dp)) }
+        ) { Icon(Icons.AutoMirrored.Filled.QueueMusic, null, tint = Amber, modifier = Modifier.size(28.dp)) }
 
         Column(modifier = Modifier.weight(1f)) {
-            Text(playlist.name, style = MaterialTheme.typography.bodyLarge,
-                fontWeight = FontWeight.SemiBold, color = TextPrimary,
-                maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(playlist.name,
+                style      = MaterialTheme.typography.bodyLarge,
+                fontWeight = FontWeight.SemiBold,
+                color      = TextPrimary,
+                maxLines   = 1,
+                overflow   = TextOverflow.Ellipsis)
             Text("$songCount song${if (songCount != 1) "s" else ""}",
                 style = MaterialTheme.typography.bodySmall)
         }
@@ -452,8 +448,11 @@ fun PlaylistItem(
             IconButton(onClick = { showMenu = true }) {
                 Icon(Icons.Filled.MoreVert, null, tint = TextSecondary)
             }
-            DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false },
-                containerColor = Surface3) {
+            DropdownMenu(
+                expanded         = showMenu,
+                onDismissRequest = { showMenu = false },
+                containerColor   = Surface3
+            ) {
                 DropdownMenuItem(
                     text        = { Text("Rename", color = TextPrimary) },
                     onClick     = { showMenu = false; showRename = true; renameText = playlist.name },
@@ -476,8 +475,10 @@ fun PlaylistItem(
             title  = { Text("Rename Playlist", color = TextPrimary) },
             text   = {
                 OutlinedTextField(
-                    value = renameText, onValueChange = { renameText = it }, singleLine = true,
-                    colors = OutlinedTextFieldDefaults.colors(
+                    value         = renameText,
+                    onValueChange = { renameText = it },
+                    singleLine    = true,
+                    colors        = OutlinedTextFieldDefaults.colors(
                         focusedBorderColor = Amber, cursorColor = Amber)
                 )
             },
@@ -487,7 +488,9 @@ fun PlaylistItem(
                 }) { Text("Save", color = Amber) }
             },
             dismissButton = {
-                TextButton(onClick = { showRename = false }) { Text("Cancel", color = TextSecondary) }
+                TextButton(onClick = { showRename = false }) {
+                    Text("Cancel", color = TextSecondary)
+                }
             }
         )
     }

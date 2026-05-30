@@ -3,7 +3,6 @@ package com.enigma.dreamer.core
 import android.net.Uri
 import com.enigma.devlyric.core.LyricDocument
 
-
 data class Song(
     val id: Long,
     val title: String,
@@ -24,14 +23,13 @@ data class Song(
 data class Playlist(
     val id: Long,
     val name: String,
-    val songIds: List<Long?> = emptyList(),
+    val songIds: List<Long> = emptyList(),   // was List<Long?> — nulls have no place here
     val createdAt: Long = System.currentTimeMillis()
 )
 
 enum class RepeatMode  { NONE, ONE, ALL }
 enum class ShuffleMode { OFF, ON }
 
-/** How songs are ordered in the library list. */
 enum class SortOrder {
     TITLE_ASC, TITLE_DESC,
     ARTIST_ASC, ARTIST_DESC,
@@ -41,13 +39,11 @@ enum class SortOrder {
     FAVORITES_FIRST
 }
 
-/** Granular player state including the async prepare window. */
 enum class BufferingState { IDLE, PREPARING, READY, ERROR }
 
-/** Sleep-timer state. */
 data class SleepTimer(
     val isActive: Boolean = false,
-    val endsAtMs: Long = 0L        // System.currentTimeMillis() + delay
+    val endsAtMs: Long = 0L
 ) {
     val remainingMs: Long get() = (endsAtMs - System.currentTimeMillis()).coerceAtLeast(0L)
 }
@@ -67,8 +63,8 @@ data class PlaybackState(
     val sleepTimer: SleepTimer = SleepTimer(),
     val error: String? = null
 ) {
-    val progress: Float   get() = if (durationMs > 0) positionMs.toFloat() / durationMs else 0f
-    val hasNext: Boolean  get() = queueIndex < queue.size - 1 || repeatMode == RepeatMode.ALL
+    val progress: Float      get() = if (durationMs > 0) positionMs.toFloat() / durationMs else 0f
+    val hasNext: Boolean     get() = queueIndex < queue.size - 1 || repeatMode == RepeatMode.ALL
     val hasPrevious: Boolean get() = queueIndex > 0 || repeatMode == RepeatMode.ALL
     val isPreparing: Boolean get() = bufferingState == BufferingState.PREPARING
 }

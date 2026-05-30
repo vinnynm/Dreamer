@@ -7,7 +7,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
-import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -23,20 +22,19 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.*
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
-import com.enigma.devlyric.core.*
 import com.enigma.dreamer.R
-import com.enigma.dreamer.ui.theme.*
-import androidx.core.animation.*
 import com.enigma.dreamer.core.Song
+import com.enigma.dreamer.ui.theme.*
 
+// ── Album Artwork ─────────────────────────────────────────────────────────────
 
 @Composable
 fun AlbumArtwork(
-    song: Song,
+    song: Song,           // non-nullable — callers handle the null check before calling
     modifier: Modifier = Modifier,
-    size: Dp = 56.dp
+    size: Dp = 56.dp,
+    shape: Shape = RoundedCornerShape(12.dp)
 ) {
-    val shape = RoundedCornerShape(12.dp)
     Box(
         modifier = modifier
             .size(size)
@@ -44,25 +42,24 @@ fun AlbumArtwork(
             .background(Surface3),
         contentAlignment = Alignment.Center
     ) {
-        if (song?.albumArtUri != null) {
+        // FIX: was `song?.albumArtUri` — song is non-nullable here, safe-call was misleading
+        if (song.albumArtUri != null) {
             AsyncImage(
                 model = ImageRequest.Builder(LocalContext.current)
                     .data(song.albumArtUri)
                     .crossfade(true)
-                    // Use default album art drawable as placeholder AND error fallback
-                    .placeholder(com.enigma.dreamer.R.drawable.ic_default_album_art)
-                    .error(com.enigma.dreamer.R.drawable.ic_default_album_art)
+                    .placeholder(R.drawable.ic_default_album_art)
+                    .error(R.drawable.ic_default_album_art)
                     .build(),
                 contentDescription = "Album art for ${song.title}",
                 contentScale       = ContentScale.Crop,
                 modifier           = Modifier.fillMaxSize()
             )
         } else {
-            // No URI at all — show default art directly
             Image(
-                painter = painterResource(R.drawable.ic_default_album_art),
+                painter            = painterResource(R.drawable.ic_default_album_art),
                 contentDescription = "Default album art",
-                modifier = Modifier.fillMaxSize()
+                modifier           = Modifier.fillMaxSize()
             )
         }
     }
@@ -91,9 +88,7 @@ fun PlaybackSlider(
             modifier = Modifier.fillMaxWidth()
         )
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 4.dp),
+            modifier              = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
             Text(formatDuration(positionMs),
@@ -131,11 +126,10 @@ fun PlaybackControls(
     modifier: Modifier = Modifier
 ) {
     Row(
-        modifier = modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
+        modifier              = modifier.fillMaxWidth(),
+        verticalAlignment     = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceEvenly
     ) {
-        // Shuffle
         IconButton(onClick = onToggleShuffle) {
             Icon(
                 Icons.Filled.Shuffle, "Shuffle",
@@ -143,20 +137,18 @@ fun PlaybackControls(
                 modifier = Modifier.size(24.dp)
             )
         }
-        // Previous
         IconButton(onClick = onPrevious, enabled = hasPrevious) {
             Icon(Icons.Filled.SkipPrevious, "Previous",
                 tint     = if (hasPrevious) TextPrimary else TextMuted,
                 modifier = Modifier.size(36.dp))
         }
-        // Play / Pause — shows spinner while buffering
         Box(
-            modifier          = Modifier
+            modifier         = Modifier
                 .size(64.dp)
                 .clip(CircleShape)
                 .background(Amber)
                 .clickable(enabled = !isPreparing, onClick = onPlayPause),
-            contentAlignment  = Alignment.Center
+            contentAlignment = Alignment.Center
         ) {
             if (isPreparing) {
                 CircularProgressIndicator(
@@ -166,10 +158,10 @@ fun PlaybackControls(
                 )
             } else {
                 val pulse by rememberInfiniteTransition(label = "pulse").animateFloat(
-                    initialValue   = 1f,
-                    targetValue    = if (isPlaying) 1.06f else 1f,
-                    animationSpec  = infiniteRepeatable(tween(900), RepeatMode.Reverse),
-                    label          = "scale"
+                    initialValue  = 1f,
+                    targetValue   = if (isPlaying) 1.06f else 1f,
+                    animationSpec = infiniteRepeatable(tween(900), RepeatMode.Reverse),
+                    label         = "scale"
                 )
                 Icon(
                     if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
@@ -179,18 +171,15 @@ fun PlaybackControls(
                 )
             }
         }
-        // Next
         IconButton(onClick = onNext, enabled = hasNext) {
             Icon(Icons.Filled.SkipNext, "Next",
                 tint     = if (hasNext) TextPrimary else TextMuted,
                 modifier = Modifier.size(36.dp))
         }
-        // Repeat
         val (repeatIcon, repeatTint) = when (repeatMode) {
             com.enigma.dreamer.core.RepeatMode.NONE -> Icons.Filled.Repeat    to TextMuted
             com.enigma.dreamer.core.RepeatMode.ALL  -> Icons.Filled.Repeat    to Amber
             com.enigma.dreamer.core.RepeatMode.ONE  -> Icons.Filled.RepeatOne to Amber
-            else -> {Icons.Filled.RepeatOne to Amber}
         }
         IconButton(onClick = onToggleRepeat) {
             Icon(repeatIcon, "Repeat", tint = repeatTint, modifier = Modifier.size(24.dp))
@@ -217,8 +206,8 @@ fun SongListItem(
             .background(bgColor, RoundedCornerShape(12.dp))
             .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .padding(horizontal = 16.dp, vertical = 10.dp),
-        verticalAlignment         = Alignment.CenterVertically,
-        horizontalArrangement     = Arrangement.spacedBy(14.dp)
+        verticalAlignment     = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         AlbumArtwork(song, size = 50.dp)
         Column(modifier = Modifier.weight(1f)) {
@@ -242,7 +231,7 @@ fun SongListItem(
     }
 }
 
-// ── Animated Now Playing Bars ────────────────────────────────────────────────
+// ── Animated Now Playing Bars ─────────────────────────────────────────────────
 
 @Composable
 fun NowPlayingIndicator(modifier: Modifier = Modifier) {
@@ -259,9 +248,9 @@ fun NowPlayingIndicator(modifier: Modifier = Modifier) {
         )
     }
     Row(
-        modifier  = modifier.height(20.dp),
-        verticalAlignment         = Alignment.Bottom,
-        horizontalArrangement     = Arrangement.spacedBy(2.dp)
+        modifier              = modifier.height(20.dp),
+        verticalAlignment     = Alignment.Bottom,
+        horizontalArrangement = Arrangement.spacedBy(2.dp)
     ) {
         heights.forEach { h ->
             Box(
@@ -302,7 +291,7 @@ fun LyricLineItem(
 
 @Composable
 fun MiniPlayer(
-    song:Song,
+    song: Song,
     isPlaying: Boolean,
     progress: Float,
     onPlayPause: () -> Unit,
@@ -317,7 +306,6 @@ fun MiniPlayer(
             .background(Surface2)
             .clickable(onClick = onClick)
     ) {
-        // Progress line at top
         Box(
             modifier = Modifier
                 .fillMaxWidth(progress.coerceIn(0f, 1f))
@@ -326,19 +314,23 @@ fun MiniPlayer(
                 .align(Alignment.TopStart)
         )
         Row(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 16.dp),
+            modifier              = Modifier.fillMaxSize().padding(horizontal = 16.dp),
             verticalAlignment     = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             AlbumArtwork(song, size = 46.dp)
             Column(modifier = Modifier.weight(1f)) {
-                Text(song.title, style = MaterialTheme.typography.bodyMedium,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis,
-                    fontWeight = FontWeight.SemiBold, color = TextPrimary)
-                Text(song.artist, style = MaterialTheme.typography.bodySmall,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis, color = TextSecondary)
+                Text(song.title,
+                    style      = MaterialTheme.typography.bodyMedium,
+                    maxLines   = 1,
+                    overflow   = TextOverflow.Ellipsis,
+                    fontWeight = FontWeight.SemiBold,
+                    color      = TextPrimary)
+                Text(song.artist,
+                    style    = MaterialTheme.typography.bodySmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    color    = TextSecondary)
             }
             IconButton(onClick = onPlayPause) {
                 Icon(

@@ -61,7 +61,7 @@ dependencies {
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     debugImplementation(libs.androidx.compose.ui.tooling)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
-    implementation("com.github.vinnynm:lyric-baker:firefly")
+    implementation("com.github.vinnynm:lyric-baker:direwolf")
 
     // ── Kotlin & Coroutines ──────────────────────────────────────────────────
     implementation ("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.1")

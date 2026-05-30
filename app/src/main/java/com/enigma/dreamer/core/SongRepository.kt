@@ -13,17 +13,8 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import java.io.File
-import kotlin.collections.map
-import kotlin.collections.sortedBy
 import androidx.core.net.toUri
 
-/**
- * Single source-of-truth for songs (MediaStore) and playlists/favorites (Room).
- *
- * Playlist persistence is now backed by Room instead of SharedPreferences.
- * Favorites are stored in the `favorites` table and merged into Song objects
- * on each load/update.
- */
 class SongRepository(private val context: Context) {
 
     private val contentResolver: ContentResolver = context.contentResolver
@@ -53,9 +44,11 @@ class SongRepository(private val context: Context) {
         )
         val selection = "${MediaStore.Audio.Media.IS_MUSIC} != 0 " +
                 "AND ${MediaStore.Audio.Media.DURATION} > 10000"
-        val sortOrder = "${MediaStore.Audio.Media.TITLE} ASC"
 
-        contentResolver.query(uri, projection, selection, null, sortOrder)?.use { cursor ->
+        contentResolver.query(
+            uri, projection, selection, null,
+            "${MediaStore.Audio.Media.TITLE} ASC"
+        )?.use { cursor ->
             val idCol       = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
             val titleCol    = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.TITLE)
             val artistCol   = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.ARTIST)
@@ -86,37 +79,35 @@ class SongRepository(private val context: Context) {
                 val lyricsDoc   = tryLoadLyrics(data)
 
                 songs += Song(
-                    id          = id,
-                    title       = title,
-                    artist      = artist,
-                    album       = album,
-                    duration    = duration,
-                    uri         = songUri,
-                    albumArtUri = albumArtUri,
+                    id            = id,
+                    title         = title,
+                    artist        = artist,
+                    album         = album,
+                    duration      = duration,
+                    uri           = songUri,
+                    albumArtUri   = albumArtUri,
                     lyricDocument = lyricsDoc,
-                    isFavorite  = id in favoriteIds,
-                    year        = year,
-                    trackNumber = track,
-                    filePath    = data,
-                    fileSize    = size,
-                    mimeType    = mime
+                    isFavorite    = id in favoriteIds,
+                    year          = year,
+                    trackNumber   = track,
+                    filePath      = data,
+                    fileSize      = size,
+                    mimeType      = mime
                 )
             }
         }
         songs
     }
 
-    /** Sort a song list according to [order]. */
     fun sort(songs: List<Song>, order: SortOrder): List<Song> = when (order) {
         SortOrder.TITLE_ASC      -> songs.sortedBy    { it.title.lowercase() }
         SortOrder.TITLE_DESC     -> songs.sortedByDescending { it.title.lowercase() }
         SortOrder.ARTIST_ASC     -> songs.sortedBy    { it.artist.lowercase() }
         SortOrder.ARTIST_DESC    -> songs.sortedByDescending { it.artist.lowercase() }
-        SortOrder.ALBUM_ASC      -> songs.sortedWith(
-            compareBy({ it.album.lowercase() }, { it.trackNumber }))
+        SortOrder.ALBUM_ASC      -> songs.sortedWith(compareBy({ it.album.lowercase() }, { it.trackNumber }))
         SortOrder.DURATION_ASC   -> songs.sortedBy    { it.duration }
         SortOrder.DURATION_DESC  -> songs.sortedByDescending { it.duration }
-        SortOrder.DATE_ADDED_DESC-> songs.sortedByDescending { it.id }   // id is insertion order in MediaStore
+        SortOrder.DATE_ADDED_DESC-> songs.sortedByDescending { it.id }
         SortOrder.FAVORITES_FIRST-> songs.sortedWith(
             compareByDescending<Song> { it.isFavorite }.thenBy { it.title.lowercase() })
     }
@@ -134,35 +125,45 @@ class SongRepository(private val context: Context) {
         favoriteDao.isFavorite(songId)
     }
 
-    // ── Playlists (Room — N+1 eliminated via batch load) ─────────────────────
+    // ── Playlists (Room) ──────────────────────────────────────────────────────
 
-    /**
-     * Observe all playlists as a live Flow. Uses a single batch query for all
-     * song-ID lists instead of one query per playlist (eliminates N+1).
-     */
-    fun observePlaylists(): Flow<List<com.enigma.dreamer.core.Playlist>> =
+    fun observePlaylists(): Flow<List<Playlist>> =
         playlistDao.observeAllWithSongIds().map { rows -> buildPlaylists(rows) }
 
-    suspend fun loadPlaylists(): List<com.enigma.dreamer.core.Playlist> = withContext(Dispatchers.IO) {
+    suspend fun loadPlaylists(): List<Playlist> = withContext(Dispatchers.IO) {
         buildPlaylists(playlistDao.getAllWithSongIds())
     }
 
+    /**
+     * Converts flat LEFT-JOIN rows into Playlist domain objects.
+     *
+     * Fixes from original:
+     * - `songId` is Long? in the row type (LEFT JOIN can produce null) but we
+     *   filter nulls out here, so Playlist.songIds is always List<Long>.
+     * - Removed the double `?: emptyList()` noise.
+     */
     private fun buildPlaylists(rows: List<PlaylistWithSongIds>): List<Playlist> {
-        // Group cross-ref rows by playlist
         val grouped = rows.groupBy { it.playlistId }
-        return rows.map { it.toPlaylistEntity() }.distinctBy { it.id }.map { entity ->
-            val ids = (grouped[entity.id]
-                ?.sortedBy { it.position }
-                ?.map { it.songId }
-                ?: emptyList())?:emptyList()
-            Playlist(entity.id, entity.name, ids, entity.createdAt)
-        }
+        return rows
+            .distinctBy { it.playlistId }
+            .map { row ->
+                val entity = row.toPlaylistEntity()
+                val ids: List<Long> = grouped[entity.id]
+                    ?.sortedBy { it.position }
+                    ?.mapNotNull { it.songId }   // filter LEFT JOIN nulls — result is List<Long>
+                    ?: emptyList()
+                Playlist(entity.id, entity.name, ids, entity.createdAt)
+            }
     }
 
+    /**
+     * Creates a playlist. Room's autoGenerate assigns the real ID;
+     * we return a Playlist with that ID so callers stay in sync.
+     */
     suspend fun createPlaylist(name: String): Playlist = withContext(Dispatchers.IO) {
-        val id = System.currentTimeMillis()
-        playlistDao.insertPlaylist(PlaylistEntity(id, name))
-        Playlist(id, name)
+        val entity    = PlaylistEntity(name = name)     // id=0 → autoGenerate
+        val generated = playlistDao.insertPlaylist(entity)
+        Playlist(generated, name)
     }
 
     suspend fun renamePlaylist(playlistId: Long, newName: String) = withContext(Dispatchers.IO) {
@@ -197,4 +198,35 @@ class SongRepository(private val context: Context) {
         }
         return null
     }
+
+    /**
+     * Bakes [lyricText] (in [format]) into the audio file at [audioPath] in-place.
+     * Returns the updated [LyricDocument] on success, null on failure.
+     */
+    suspend fun bakeLyrics(
+        audioPath: String,
+        lyricText: String,
+        format: LyricFormat
+    ): LyricDocument? = withContext(Dispatchers.IO) {
+        runCatching {
+            val file   = File(audioPath)
+            val ext    = audioPath.substringAfterLast('.').lowercase()
+            val doc    = LyricParser.parse(lyricText, format)
+            val result = LyricBaker.bake(file, doc)
+            if (result is com.enigma.devlyric.core.BakeResult.Success) doc else null
+        }.getOrNull()
+    }
+
+    /**
+     * Saves [lyricText] as a sidecar .lrc file next to the audio file.
+     * Useful when the audio format doesn't support embedded tags.
+     */
+    suspend fun saveSidecarLrc(audioPath: String, lyricText: String): Boolean =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val lrcPath = audioPath.substringBeforeLast('.') + ".lrc"
+                File(lrcPath).writeText(lyricText)
+                true
+            }.getOrDefault(false)
+        }
 }

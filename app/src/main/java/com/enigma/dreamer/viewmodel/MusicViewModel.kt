@@ -5,7 +5,6 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
-import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.net.Uri
@@ -22,32 +21,24 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
-import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.flow.filter
-import kotlinx.coroutines.flow.firstOrNull
-import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.flow.mapNotNull
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlin.collections.sort
-
 
 class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     private val repo = SongRepository(application)
 
-    // ── Use Cases ─────────────────────────────────────────────────────────────
-    private val getSongsUseCase = GetSongsUseCase(repo)
-    private val getPlaylistsUseCase = GetPlaylistsUseCase(repo)
-    private val searchSongsUseCase = SearchSongsUseCase()
-    private val sortSongsUseCase = SortSongsUseCase(repo)
-    private val toggleFavoriteUseCase = ToggleFavoriteUseCase(repo)
-    private val observeFavoritesUseCase = ObserveFavoritesUseCase(repo)
-    private val createPlaylistUseCase = CreatePlaylistUseCase(repo)
-    private val addSongToPlaylistUseCase = AddSongToPlaylistUseCase(repo)
+    private val getSongsUseCase               = GetSongsUseCase(repo)
+    private val getPlaylistsUseCase           = GetPlaylistsUseCase(repo)
+    private val searchSongsUseCase            = SearchSongsUseCase()
+    private val sortSongsUseCase              = SortSongsUseCase(repo)
+    private val toggleFavoriteUseCase         = ToggleFavoriteUseCase(repo)
+    private val observeFavoritesUseCase       = ObserveFavoritesUseCase(repo)
+    private val createPlaylistUseCase         = CreatePlaylistUseCase(repo)
+    private val addSongToPlaylistUseCase      = AddSongToPlaylistUseCase(repo)
     private val removeSongFromPlaylistUseCase = RemoveSongFromPlaylistUseCase(repo)
-    private val deletePlaylistUseCase = DeletePlaylistUseCase(repo)
-    private val renamePlaylistUseCase = RenamePlaylistUseCase(repo)
+    private val deletePlaylistUseCase         = DeletePlaylistUseCase(repo)
+    private val renamePlaylistUseCase         = RenamePlaylistUseCase(repo)
 
     // ── State ─────────────────────────────────────────────────────────────────
 
@@ -72,7 +63,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 b.service.playbackState.collect { ps -> updatePlayback(ps) }
             }
             startPositionTracking()
-            // Try to restore last session once service is bound and songs are loaded
+            // tryRestoreSession is guarded internally — safe to call from both paths
             readyState?.songs?.let { b.service.tryRestoreSession(it) }
         }
         override fun onServiceDisconnected(name: ComponentName) {
@@ -104,7 +95,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 )
                 observePlaylists()
                 observeFavorites()
-                // Session restore (service may already be connected)
+                // tryRestoreSession is guarded — safe to call here too
                 musicService?.tryRestoreSession(songs)
             } catch (e: Exception) {
                 _uiState.value = MusicUiState.Error(e.message ?: "Failed to load songs")
@@ -141,10 +132,11 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     fun playSong(song: Song, queue: List<Song> = readyState?.songs ?: listOf(song)) {
         val index = queue.indexOfFirst { it.id == song.id }.coerceAtLeast(0)
         musicService?.setQueue(queue, index) ?: return
-        // Mark as playing optimistically (onPrepared in service will confirm)
-        mutateReady { copy(playbackState = playbackState.copy(
-            isPlaying = true, bufferingState = BufferingState.PREPARING
-        ))}
+        mutateReady {
+            copy(playbackState = playbackState.copy(
+                isPlaying = true, bufferingState = BufferingState.PREPARING
+            ))
+        }
         extractAndApplyColor(song.albumArtUri)
     }
 
@@ -152,13 +144,14 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         val state = readyState ?: return
         val songs = playlist.songIds.mapNotNull { id -> state.songs.find { it.id == id } }
         if (songs.isEmpty()) return
-        val queue = if (currentShuffleMode() == ShuffleMode.ON) songs.shuffled() else songs
-        musicService?.setQueue(queue, 0)
-        mutateReady { copy(playbackState = playbackState.copy(
-            currentPlaylistId = playlist.id,
-            isPlaying         = true,
-            bufferingState    = BufferingState.PREPARING
-        ))}
+        musicService?.setQueue(songs, 0)
+        mutateReady {
+            copy(playbackState = playbackState.copy(
+                currentPlaylistId = playlist.id,
+                isPlaying         = true,
+                bufferingState    = BufferingState.PREPARING
+            ))
+        }
         songs.firstOrNull()?.albumArtUri?.let { extractAndApplyColor(it) }
     }
 
@@ -202,27 +195,33 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         mutateReady { copy(showQueue = !showQueue) }
     }
 
-    /** Insert [song] immediately after the current track in the queue. */
+    /**
+     * FIX: was calling service.setQueue() which restarted the current track.
+     * Now uses insertIntoQueue() which calls ExoPlayer's addMediaItem() directly.
+     */
     fun playNext(song: Song) {
         val service = musicService ?: return
         val ps      = service.playbackState.value
         if (ps.queue.isEmpty()) { playSong(song); return }
         val insertAt = (ps.queueIndex + 1).coerceAtMost(ps.queue.size)
-        val newQueue = ps.queue.toMutableList().also { it.add(insertAt, song) }
-        service.setQueue(newQueue, ps.queueIndex)    // index unchanged — current song stays
+        service.insertIntoQueue(song, insertAt)
         mutateReady {
-            copy(playbackState = playbackState.copy(queue = newQueue))
+            copy(playbackState = playbackState.copy(queue = service.playbackState.value.queue))
         }
     }
 
-    /** Append [song] to the end of the current queue. */
+    /**
+     * FIX: was calling service.setQueue() which restarted the current track.
+     * Now uses appendToQueue() which calls ExoPlayer's addMediaItem() directly.
+     */
     fun addToQueue(song: Song) {
         val service = musicService ?: return
         val ps      = service.playbackState.value
         if (ps.queue.isEmpty()) { playSong(song); return }
-        val newQueue = ps.queue + song
-        service.setQueue(newQueue, ps.queueIndex)
-        mutateReady { copy(playbackState = playbackState.copy(queue = newQueue)) }
+        service.appendToQueue(song)
+        mutateReady {
+            copy(playbackState = playbackState.copy(queue = service.playbackState.value.queue))
+        }
     }
 
     fun skipToQueueItem(index: Int) {
@@ -230,9 +229,13 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         val ps      = service.playbackState.value
         val song    = ps.queue.getOrNull(index) ?: return
         service.setQueue(ps.queue, index)
-        mutateReady { copy(playbackState = playbackState.copy(
-            queue = ps.queue, queueIndex = index, currentSong = song
-        ))}
+        mutateReady {
+            copy(playbackState = playbackState.copy(
+                queue       = ps.queue,
+                queueIndex  = index,
+                currentSong = song
+            ))
+        }
         extractAndApplyColor(song.albumArtUri)
     }
 
@@ -268,9 +271,6 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun applySearch(songs: List<Song>, query: String): List<Song> =
-        searchSongsUseCase(songs, query)
-
     // ── Playlists ─────────────────────────────────────────────────────────────
 
     fun createPlaylist(name: String) {
@@ -299,16 +299,57 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         mutateReady { copy(showLyrics = !showLyrics) }
     }
 
-    fun embedLyrics(song: Song, lyricText: String, format: LyricFormat) {
+    /**
+     * Bakes [lyricText] into the audio file on disk and updates the in-memory
+     * Song so the change is reflected immediately in the UI without reload.
+     * Returns true on success.
+     */
+    fun bakeLyricsToSong(
+        song: Song,
+        lyricText: String,
+        format: LyricFormat,
+        onResult: (success: Boolean, message: String) -> Unit
+    ) {
         viewModelScope.launch {
             try {
-                val doc         = LyricParser.parse(lyricText, format)
-                val updatedSong = song.copy(lyricDocument = doc)
-                mutateReady { copy(songs = songs.map { if (it.id == song.id) updatedSong else it }) }
+                val doc = repo.bakeLyrics(song.filePath, lyricText, format)
+                if (doc != null) {
+                    val updated = song.copy(lyricDocument = doc)
+                    mutateReady {
+                        val newSongs = songs.map { if (it.id == song.id) updated else it }
+                        copy(
+                            songs         = newSongs,
+                            filteredSongs = searchSongsUseCase(newSongs, searchQuery),
+                            // update currently playing song if it's the same one
+                            playbackState = if (playbackState.currentSong?.id == song.id)
+                                playbackState.copy(currentSong = updated)
+                            else playbackState
+                        )
+                    }
+                    onResult(true, "Lyrics baked into ${song.title}")
+                } else {
+                    // Unsupported format — save sidecar .lrc instead
+                    val sidecarOk = repo.saveSidecarLrc(song.filePath, lyricText)
+                    if (sidecarOk) {
+                        val parsed  = LyricParser.parse(lyricText, format)
+                        val updated = song.copy(lyricDocument = parsed)
+                        mutateReady {
+                            val newSongs = songs.map { if (it.id == song.id) updated else it }
+                            copy(
+                                songs         = newSongs,
+                                filteredSongs = searchSongsUseCase(newSongs, searchQuery),
+                                playbackState = if (playbackState.currentSong?.id == song.id)
+                                    playbackState.copy(currentSong = updated)
+                                else playbackState
+                            )
+                        }
+                        onResult(true, "Saved as sidecar .lrc file")
+                    } else {
+                        onResult(false, "Could not write lyrics — check storage permission")
+                    }
+                }
             } catch (e: Exception) {
-                mutateReady { copy(playbackState = playbackState.copy(
-                    error = "Lyric parse failed: ${e.message}"
-                ))}
+                onResult(false, "Error: ${e.message}")
             }
         }
     }
@@ -337,9 +378,9 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun dominantColor(bmp: android.graphics.Bitmap): Int {
-        val stepX = bmp.width  / 12f
-        val stepY = bmp.height / 12f
-        val hsv   = FloatArray(3)
+        val stepX   = bmp.width  / 12f
+        val stepY   = bmp.height / 12f
+        val hsv     = FloatArray(3)
         val samples = (0..11).flatMap { row ->
             (0..11).map { col -> bmp.getPixel((col * stepX).toInt(), (row * stepY).toInt()) }
         }
@@ -353,10 +394,11 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun contrastColor(bgColor: Int): Int {
-        fun lin(c: Double) = if (c <= 0.04045) c / 12.92 else Math.pow((c + 0.055) / 1.055, 2.4)
-        val lum = 0.2126 * lin(Color.red(bgColor) / 255.0) +
-                0.7152 * lin(Color.green(bgColor) / 255.0) +
-                0.0722 * lin(Color.blue(bgColor)  / 255.0)
+        fun lin(c: Double) = if (c <= 0.04045) c / 12.92
+        else Math.pow((c + 0.055) / 1.055, 2.4)
+        val lum = 0.2126 * lin(Color.red(bgColor)   / 255.0) +
+                0.7152 * lin(Color.green(bgColor)  / 255.0) +
+                0.0722 * lin(Color.blue(bgColor)   / 255.0)
         return if (lum > 0.179) Color.parseColor("#1A1A1A") else Color.WHITE
     }
 
@@ -367,10 +409,10 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         positionJob = viewModelScope.launch {
             while (true) {
                 delay(500)
-                val service = musicService ?: continue
-                val pos     = service.currentPosition()
-                val state   = readyState ?: continue
-                val song    = state.playbackState.currentSong
+                val service  = musicService ?: continue
+                val pos      = service.currentPosition()
+                val state    = readyState   ?: continue
+                val song     = state.playbackState.currentSong
                 val lyricIdx = song?.lyricDocument?.let { findCurrentLyricLine(it, pos) } ?: -1
                 mutateReady {
                     copy(

@@ -15,23 +15,35 @@ import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
-import kotlin.jvm.java
 
 /**
- * Foreground media playback service — Media3 / ExoPlayer rewrite.
+ * Foreground media playback service — Media3 / ExoPlayer.
  *
- * Key behaviours retained from the original:
- *  - MediaLibraryService (extends MediaSessionService) → proper media button / lock-screen handling
- *  - ExoPlayer handles audio focus, ducking, and buffering natively
- *  - Queue + position persisted to SharedPreferences on every change / destroy
- *  - Notification built by MediaNotification.Provider for full Media Style support
- *  - Sleep timer with Handler-based countdown
- *  - Playback speed via ExoPlayer.setPlaybackParameters
- *  - Shuffle / Repeat cycle exposed as custom session commands so the UI can drive them
- *  - Album-art dominant-colour theming kept for legacy notification colouring
+ * ── Notification fix summary ─────────────────────────────────────────────────
+ *
+ * Root cause of blank white notification: three things were all missing at once.
+ *
+ * 1. No notification channel  →  nothing to post into on API 26+.
+ * 2. No MediaNotification.Provider attached via setMediaNotificationProvider()
+ *    →  Media3's internal fallback produces a minimal notification with no color.
+ * 3. Album art stored in a local field but never injected into the Player's
+ *    MediaMetadata  →  notification provider has no bitmap to show.
+ *
+ * Fix:
+ *  - [DreamerNotificationProvider] extends [DefaultMediaNotificationProvider],
+ *    which handles all MediaStyle / compat wiring correctly for modern Android.
+ *    We override only [addNotificationActions] to apply color + large icon.
+ *  - [updateAlbumArt] calls [Player.replaceMediaItem] with the new
+ *    [MediaMetadata.artworkData] (an in-memory JPEG byte array).
+ *    DefaultMediaNotificationProvider reads artworkData in preference to
+ *    artworkUri, so the art appears without any network fetch.
+ *  - [DreamerNotificationProvider.setAccentColor] stores the dominant color;
+ *    it is applied via setColor() + setColorized(true) in the builder callback.
  */
 @OptIn(UnstableApi::class)
 class MusicService : MediaLibraryService() {
+
+    // ── Binder ────────────────────────────────────────────────────────────────
 
     inner class MusicBinder : Binder() {
         val service: MusicService get() = this@MusicService
@@ -41,6 +53,7 @@ class MusicService : MediaLibraryService() {
 
     override fun onBind(intent: Intent?): IBinder? {
         val superBinder = super.onBind(intent)
+        // Direct VM connections have no action; Media3/system connections carry one.
         return if (intent?.action == null) binder else superBinder
     }
 
@@ -49,19 +62,23 @@ class MusicService : MediaLibraryService() {
     private val _playbackState = MutableStateFlow(PlaybackState())
     val playbackState: StateFlow<PlaybackState> = _playbackState
 
-    // ── ExoPlayer + MediaSession ──────────────────────────────────────────────
+    private var originalQueue: List<Song> = emptyList()
+
+    @Volatile private var sessionRestored = false
+
+    // ── Core objects ──────────────────────────────────────────────────────────
 
     private lateinit var player: ExoPlayer
     private lateinit var mediaSession: MediaLibrarySession
+    private lateinit var notificationProvider: DreamerNotificationProvider
 
-    // ── Album art ─────────────────────────────────────────────────────────────
+    // ── Album art / color ─────────────────────────────────────────────────────
 
     private var albumArtBitmap: Bitmap? = null
-    private var notificationBgColor: Int = Color.parseColor("#1A1A1A")
 
     // ── Sleep timer ───────────────────────────────────────────────────────────
 
-    private val sleepHandler = Handler(Looper.getMainLooper())
+    private val sleepHandler  = Handler(Looper.getMainLooper())
     private var sleepRunnable: Runnable? = null
 
     // ── Coroutine scope ───────────────────────────────────────────────────────
@@ -74,7 +91,7 @@ class MusicService : MediaLibraryService() {
         getSharedPreferences("playback_state", Context.MODE_PRIVATE)
     }
 
-    // ── Custom session commands ───────────────────────────────────────────────
+    // ── Constants ─────────────────────────────────────────────────────────────
 
     companion object {
         const val CMD_TOGGLE_SHUFFLE   = "cmd_toggle_shuffle"
@@ -83,28 +100,30 @@ class MusicService : MediaLibraryService() {
         const val CMD_SET_SPEED        = "cmd_set_speed"
         const val CMD_START_SLEEP      = "cmd_start_sleep"
         const val CMD_CANCEL_SLEEP     = "cmd_cancel_sleep"
-        const val CMD_UPDATE_ALBUM_ART = "cmd_update_album_art"
         const val EXTRA_SPEED          = "extra_speed"
         const val EXTRA_DELAY_MS       = "extra_delay_ms"
+
+        const val NOTIF_CHANNEL_ID = "dreamer_playback"
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     override fun onCreate() {
         super.onCreate()
+        createNotificationChannel()
         buildPlayer()
         buildMediaSession()
-        // Observe ExoPlayer state → mirror to our StateFlow
         observePlayerState()
+        // Must be set AFTER buildMediaSession() so the session reference exists
+        notificationProvider = DreamerNotificationProvider(this, NOTIF_CHANNEL_ID)
+        setMediaNotificationProvider(notificationProvider)
     }
 
-    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibrarySession =
-        mediaSession
+    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo) = mediaSession
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
         persistState()
-        // Stop service if nothing is playing
         if (!player.isPlaying) stopSelf()
     }
 
@@ -118,6 +137,24 @@ class MusicService : MediaLibraryService() {
         super.onDestroy()
     }
 
+    // ── Notification channel ──────────────────────────────────────────────────
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                NOTIF_CHANNEL_ID,
+                "Music Playback",
+                NotificationManager.IMPORTANCE_LOW       // silent: no heads-up, no sound
+            ).apply {
+                description          = "Shows the currently playing song with transport controls"
+                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+                setShowBadge(false)
+            }
+            getSystemService(NotificationManager::class.java)
+                ?.createNotificationChannel(channel)
+        }
+    }
+
     // ── Build ExoPlayer ───────────────────────────────────────────────────────
 
     private fun buildPlayer() {
@@ -127,66 +164,83 @@ class MusicService : MediaLibraryService() {
                     .setUsage(C.USAGE_MEDIA)
                     .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
                     .build(),
-                /* handleAudioFocus= */ true   // ExoPlayer manages focus + ducking
+                true   // handleAudioFocus
             )
-            .setHandleAudioBecomingNoisy(true)  // pause on headphone unplug
+            .setHandleAudioBecomingNoisy(true)
             .build()
+        // We own the queue order; ExoPlayer's shuffle must stay OFF so that
+        // currentMediaItemIndex always matches our queue list 1-to-1.
+        player.shuffleModeEnabled = false
     }
 
     // ── Build MediaSession ────────────────────────────────────────────────────
 
     private fun buildMediaSession() {
-        mediaSession = MediaLibrarySession.Builder(this, player, object : MediaLibrarySession.Callback {
+        mediaSession = MediaLibrarySession.Builder(
+            this, player,
+            object : MediaLibrarySession.Callback {
 
-            // ── Custom commands from UI ────────────────────────────────────
-
-            override fun onCustomCommand(
-                session: MediaSession,
-                controller: MediaSession.ControllerInfo,
-                customCommand: SessionCommand,
-                args: Bundle
-            ): ListenableFuture<SessionResult> {
-                when (customCommand.customAction) {
-                    CMD_TOGGLE_SHUFFLE  -> toggleShuffleInternal()
-                    CMD_CYCLE_REPEAT    -> cycleRepeatInternal()
-                    CMD_TOGGLE_FAVORITE -> toggleFavoriteInternal()
-                    CMD_SET_SPEED       -> {
-                        val speed = args.getFloat(EXTRA_SPEED, 1f)
-                        setPlaybackSpeed(speed)
+                override fun onCustomCommand(
+                    session: MediaSession,
+                    controller: MediaSession.ControllerInfo,
+                    customCommand: SessionCommand,
+                    args: Bundle
+                ): ListenableFuture<SessionResult> {
+                    when (customCommand.customAction) {
+                        CMD_TOGGLE_SHUFFLE  -> toggleShuffleInternal()
+                        CMD_CYCLE_REPEAT    -> cycleRepeatInternal()
+                        CMD_TOGGLE_FAVORITE -> toggleFavoriteInternal()
+                        CMD_SET_SPEED       -> setPlaybackSpeed(args.getFloat(EXTRA_SPEED, 1f))
+                        CMD_START_SLEEP     -> {
+                            val delay = args.getLong(EXTRA_DELAY_MS, 0L)
+                            if (delay > 0) startSleepTimer(delay)
+                        }
+                        CMD_CANCEL_SLEEP -> cancelSleepTimer()
                     }
-                    CMD_START_SLEEP     -> {
-                        val delay = args.getLong(EXTRA_DELAY_MS, 0L)
-                        if (delay > 0) startSleepTimer(delay)
-                    }
-                    CMD_CANCEL_SLEEP    -> cancelSleepTimer()
+                    return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
                 }
-                return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
-            }
 
-            // Allow all controllers (no Hilt / permission checks needed)
-            override fun onConnect(
-                session: MediaSession,
-                controller: MediaSession.ControllerInfo
-            ): MediaSession.ConnectionResult =
-                MediaSession.ConnectionResult.AcceptedResultBuilder(session)
-                    .setAvailableSessionCommands(
-                        SessionCommands.Builder()
-                            .add(SessionCommand(CMD_TOGGLE_SHUFFLE,  Bundle.EMPTY))
-                            .add(SessionCommand(CMD_CYCLE_REPEAT,    Bundle.EMPTY))
-                            .add(SessionCommand(CMD_TOGGLE_FAVORITE, Bundle.EMPTY))
-                            .add(SessionCommand(CMD_SET_SPEED,       Bundle.EMPTY))
-                            .add(SessionCommand(CMD_START_SLEEP,     Bundle.EMPTY))
-                            .add(SessionCommand(CMD_CANCEL_SLEEP,    Bundle.EMPTY))
-                            .build()
+                override fun onConnect(
+                    session: MediaSession,
+                    controller: MediaSession.ControllerInfo
+                ): MediaSession.ConnectionResult =
+                    MediaSession.ConnectionResult.AcceptedResultBuilder(session)
+                        .setAvailableSessionCommands(
+                            SessionCommands.Builder()
+                                .add(SessionCommand(CMD_TOGGLE_SHUFFLE,  Bundle.EMPTY))
+                                .add(SessionCommand(CMD_CYCLE_REPEAT,    Bundle.EMPTY))
+                                .add(SessionCommand(CMD_TOGGLE_FAVORITE, Bundle.EMPTY))
+                                .add(SessionCommand(CMD_SET_SPEED,       Bundle.EMPTY))
+                                .add(SessionCommand(CMD_START_SLEEP,     Bundle.EMPTY))
+                                .add(SessionCommand(CMD_CANCEL_SLEEP,    Bundle.EMPTY))
+                                .build()
+                        )
+                        .build()
+
+                override fun onGetLibraryRoot(
+                    session: MediaLibrarySession,
+                    browser: MediaSession.ControllerInfo,
+                    params: LibraryParams?
+                ): ListenableFuture<LibraryResult<MediaItem>> =
+                    Futures.immediateFuture(
+                        LibraryResult.ofItem(
+                            MediaItem.Builder().setMediaId("root")
+                                .setMediaMetadata(
+                                    MediaMetadata.Builder()
+                                        .setIsBrowsable(true)
+                                        .setIsPlayable(false)
+                                        .build()
+                                ).build(),
+                            null
+                        )
                     )
-                    .build()
-
-        })
+            }
+        )
             .setSessionActivity(buildTapIntent())
             .build()
     }
 
-    // ── Observe ExoPlayer → mirror state ─────────────────────────────────────
+    // ── Observe ExoPlayer state ───────────────────────────────────────────────
 
     private fun observePlayerState() {
         player.addListener(object : Player.Listener {
@@ -204,22 +258,21 @@ class MusicService : MediaLibraryService() {
                     queueIndex  = idx,
                     positionMs  = 0L
                 )
-                // Clear previous album art on track change
-                albumArtBitmap?.recycle(); albumArtBitmap = null
-                notificationBgColor = Color.parseColor("#1A1A1A")
+                albumArtBitmap?.recycle()
+                albumArtBitmap = null
+                notificationProvider.setAccentColor(Color.parseColor("#1A1A1A"))
                 persistState()
             }
 
             override fun onPlaybackStateChanged(state: Int) {
-                val bufState = when (state) {
-                    Player.STATE_BUFFERING -> BufferingState.PREPARING
-                    Player.STATE_READY     -> BufferingState.READY
-                    Player.STATE_ENDED     -> BufferingState.READY
-                    else                   -> BufferingState.PREPARING
-                }
                 _playbackState.value = _playbackState.value.copy(
-                    bufferingState = bufState,
-                    durationMs     = player.duration.coerceAtLeast(0L)
+                    bufferingState = when (state) {
+                        Player.STATE_BUFFERING -> BufferingState.PREPARING
+                        Player.STATE_READY     -> BufferingState.READY
+                        Player.STATE_ENDED     -> BufferingState.READY
+                        else                   -> BufferingState.PREPARING
+                    },
+                    durationMs = player.duration.coerceAtLeast(0L)
                 )
             }
 
@@ -231,19 +284,14 @@ class MusicService : MediaLibraryService() {
                 )
             }
 
-            override fun onShuffleModeEnabledChanged(shuffleModeEnabled: Boolean) {
-                val mode = if (shuffleModeEnabled) ShuffleMode.ON else ShuffleMode.OFF
-                _playbackState.value = _playbackState.value.copy(shuffleMode = mode)
-                persistState()
-            }
-
             override fun onRepeatModeChanged(repeatMode: Int) {
-                val mode = when (repeatMode) {
-                    Player.REPEAT_MODE_ONE -> RepeatMode.ONE
-                    Player.REPEAT_MODE_ALL -> RepeatMode.ALL
-                    else                   -> RepeatMode.NONE
-                }
-                _playbackState.value = _playbackState.value.copy(repeatMode = mode)
+                _playbackState.value = _playbackState.value.copy(
+                    repeatMode = when (repeatMode) {
+                        Player.REPEAT_MODE_ONE -> RepeatMode.ONE
+                        Player.REPEAT_MODE_ALL -> RepeatMode.ALL
+                        else                   -> RepeatMode.NONE
+                    }
+                )
                 persistState()
             }
         })
@@ -252,37 +300,49 @@ class MusicService : MediaLibraryService() {
     // ── Public API ────────────────────────────────────────────────────────────
 
     fun setQueue(queue: List<Song>, index: Int) {
+        originalQueue = queue
+        val ps  = _playbackState.value
         val idx = index.coerceIn(0, (queue.size - 1).coerceAtLeast(0))
-        val items = queue.map { it.toMediaItem() }
-        player.setMediaItems(items, idx, C.TIME_UNSET)
-        player.prepare()
-        _playbackState.value = _playbackState.value.copy(
-            queue       = queue,
-            queueIndex  = idx,
-            currentSong = queue.getOrNull(idx),
+
+        val effectiveQueue = if (ps.shuffleMode == ShuffleMode.ON)
+            buildShuffledQueue(queue, idx) else queue
+        val effectiveIdx = if (ps.shuffleMode == ShuffleMode.ON) 0 else idx
+
+        loadQueueIntoPlayer(effectiveQueue, effectiveIdx)
+        _playbackState.value = ps.copy(
+            queue       = effectiveQueue,
+            queueIndex  = effectiveIdx,
+            currentSong = effectiveQueue.getOrNull(effectiveIdx),
             positionMs  = 0L
         )
         persistState()
     }
 
-    fun play() {
-        player.play()
+    fun insertIntoQueue(song: Song, insertIndex: Int) {
+        val ps      = _playbackState.value
+        val safeIdx = insertIndex.coerceIn(0, ps.queue.size)
+        val newQueue = ps.queue.toMutableList().also { it.add(safeIdx, song) }
+        player.addMediaItem(safeIdx, song.toMediaItem())
+        val newQueueIdx = if (safeIdx <= ps.queueIndex) ps.queueIndex + 1 else ps.queueIndex
+        _playbackState.value = ps.copy(queue = newQueue, queueIndex = newQueueIdx)
+        persistState()
     }
 
-    fun pause() {
-        player.pause()
+    fun appendToQueue(song: Song) {
+        val ps       = _playbackState.value
+        val newQueue = ps.queue + song
+        player.addMediaItem(song.toMediaItem())
+        _playbackState.value = ps.copy(queue = newQueue)
+        persistState()
     }
 
-    fun next() {
-        if (player.hasNextMediaItem()) player.seekToNextMediaItem()
-    }
+    fun play()     { player.play() }
+    fun pause()    { player.pause() }
+    fun next()     { if (player.hasNextMediaItem()) player.seekToNextMediaItem() }
 
     fun previous() {
-        if (player.currentPosition > 3_000L) {
-            player.seekTo(0L)
-        } else if (player.hasPreviousMediaItem()) {
-            player.seekToPreviousMediaItem()
-        }
+        if (player.currentPosition > 3_000L) player.seekTo(0L)
+        else if (player.hasPreviousMediaItem()) player.seekToPreviousMediaItem()
     }
 
     fun seekTo(positionMs: Long) {
@@ -294,26 +354,34 @@ class MusicService : MediaLibraryService() {
     fun currentPosition(): Long = player.currentPosition
 
     fun setRepeatMode(mode: RepeatMode) {
-        player.repeatMode = when (mode) {
-            RepeatMode.ONE  -> Player.REPEAT_MODE_ONE
-            RepeatMode.ALL  -> Player.REPEAT_MODE_ALL
-            RepeatMode.NONE -> Player.REPEAT_MODE_OFF
-        }
-        // State mirrored via listener
+        player.repeatMode = mode.toExoRepeat()
+        _playbackState.value = _playbackState.value.copy(repeatMode = mode)
+        persistState()
     }
 
     fun setShuffleMode(mode: ShuffleMode) {
-        player.shuffleModeEnabled = (mode == ShuffleMode.ON)
-        // State mirrored via listener; also re-sync our queue model
         val ps = _playbackState.value
-        val newQueue = if (mode == ShuffleMode.ON) {
-            val cur  = ps.currentSong
-            val rest = ps.queue.filter { it.id != cur?.id }.shuffled()
-            if (cur != null) listOf(cur) + rest else rest
+        if (ps.shuffleMode == mode) return
+        val savedPos = player.currentPosition
+
+        val newQueue: List<Song>
+        val newIdx:   Int
+        if (mode == ShuffleMode.ON) {
+            val currentSong = ps.currentSong
+            val source = originalQueue.ifEmpty { ps.queue }
+            newQueue = buildShuffledQueue(
+                source,
+                source.indexOfFirst { it.id == currentSong?.id }.coerceAtLeast(0)
+            )
+            newIdx = 0
         } else {
-            ps.queue.sortedBy { it.title }
+            newQueue = originalQueue.ifEmpty { ps.queue }
+            newIdx   = newQueue.indexOfFirst { it.id == ps.currentSong?.id }.coerceAtLeast(0)
         }
-        val newIdx = newQueue.indexOfFirst { it.id == ps.currentSong?.id }.coerceAtLeast(0)
+
+        // To prevent playback from restarting from the beginning of the list,
+        // we update the player's queue and then seek to the current song's new index.
+        player.setMediaItems(newQueue.map { it.toMediaItem() }, newIdx, savedPos)
         _playbackState.value = ps.copy(queue = newQueue, queueIndex = newIdx, shuffleMode = mode)
         persistState()
     }
@@ -344,21 +412,49 @@ class MusicService : MediaLibraryService() {
         _playbackState.value = _playbackState.value.copy(sleepTimer = SleepTimer())
     }
 
+    /**
+     * Called from [MusicViewModel] after the album art bitmap is decoded.
+     *
+     * The three steps below are ALL required for a colored notification with art:
+     *
+     * 1. Scale the bitmap to notification resolution (256 px square max).
+     * 2. Derive the dominant accent color and pass it to the notification provider.
+     * 3. Encode the bitmap as JPEG bytes and inject them into the current
+     *    [MediaItem]'s [MediaMetadata.artworkData] via [Player.replaceMediaItem].
+     *    [DefaultMediaNotificationProvider] reads `artworkData` first (in-memory,
+     *    no URI fetch needed), which is what actually makes art appear.
+     */
     fun updateAlbumArt(bitmap: Bitmap) {
         val scaled = scaleBitmap(bitmap, 256)
         albumArtBitmap?.recycle()
         albumArtBitmap = scaled
-        notificationBgColor = dominantColor(scaled)
-        // Re-trigger notification rebuild (Media3 uses its own MediaNotification infra,
-        // but colouring is done via MediaNotification.Provider below)
-        mediaSession.broadcastCustomCommand(
-            SessionCommand(CMD_UPDATE_ALBUM_ART, Bundle.EMPTY), Bundle.EMPTY
+
+        val accentColor = dominantColor(scaled)
+        notificationProvider.setAccentColor(accentColor)
+
+        val artBytes = bitmapToJpegBytes(scaled)
+        val idx      = player.currentMediaItemIndex
+        val current  = player.currentMediaItem ?: return
+
+        // replaceMediaItem updates metadata only — playback is NOT interrupted
+        player.replaceMediaItem(
+            idx,
+            current.buildUpon()
+                .setMediaMetadata(
+                    current.mediaMetadata.buildUpon()
+                        .setArtworkData(artBytes, MediaMetadata.PICTURE_TYPE_FRONT_COVER)
+                        .build()
+                )
+                .build()
         )
     }
 
-    // ── Restore last session ──────────────────────────────────────────────────
+    // ── Session restore ───────────────────────────────────────────────────────
 
     fun tryRestoreSession(allSongs: List<Song>): Boolean {
+        if (sessionRestored) return false
+        sessionRestored = true
+
         val idx         = prefs.getInt("queue_index", -1)
         val pos         = prefs.getLong("position_ms", 0L)
         val repeat      = prefs.getString("repeat", RepeatMode.NONE.name)
@@ -368,18 +464,23 @@ class MusicService : MediaLibraryService() {
             ?.let { runCatching { ShuffleMode.valueOf(it) }.getOrDefault(ShuffleMode.OFF) }
             ?: ShuffleMode.OFF
         val queueIdsRaw = prefs.getString("queue_ids", "") ?: ""
+        val origIdsRaw  = prefs.getString("orig_ids",  "") ?: ""
+
         if (queueIdsRaw.isBlank() || idx < 0) return false
 
-        val queueIds = queueIdsRaw.split(",").mapNotNull { it.toLongOrNull() }
-        val queue    = queueIds.mapNotNull { id -> allSongs.find { it.id == id } }
+        val queue = queueIdsRaw.split(",")
+            .mapNotNull { it.toLongOrNull()?.let { id -> allSongs.find { s -> s.id == id } } }
         if (queue.isEmpty() || idx >= queue.size) return false
 
-        val items = queue.map { it.toMediaItem() }
-        player.setMediaItems(items, idx, pos)
-        player.prepare()
-        // Modes
-        player.repeatMode        = repeat.toExoRepeat()
-        player.shuffleModeEnabled = shuffle == ShuffleMode.ON
+        originalQueue = if (origIdsRaw.isNotBlank())
+            origIdsRaw.split(",")
+                .mapNotNull { it.toLongOrNull()?.let { id -> allSongs.find { s -> s.id == id } } }
+                .ifEmpty { queue }
+        else queue
+
+        loadQueueIntoPlayer(queue, idx)
+        player.seekTo(idx, pos)
+        player.repeatMode = repeat.toExoRepeat()
 
         _playbackState.value = _playbackState.value.copy(
             queue       = queue,
@@ -397,18 +498,21 @@ class MusicService : MediaLibraryService() {
     private fun persistState() {
         val ps = _playbackState.value
         prefs.edit()
-            .putString("queue_ids",  ps.queue.joinToString(",") { it.id.toString() })
-            .putInt("queue_index",   ps.queueIndex)
-            .putLong("position_ms",  currentPosition())
-            .putString("repeat",     ps.repeatMode.name)
-            .putString("shuffle",    ps.shuffleMode.name)
+            .putString("queue_ids", ps.queue.joinToString(",") { it.id.toString() })
+            .putString("orig_ids",  originalQueue.joinToString(",") { it.id.toString() })
+            .putInt("queue_index",  ps.queueIndex)
+            .putLong("position_ms", currentPosition())
+            .putString("repeat",    ps.repeatMode.name)
+            .putString("shuffle",   ps.shuffleMode.name)
             .apply()
     }
 
     // ── Internal command handlers ─────────────────────────────────────────────
 
     private fun toggleShuffleInternal() =
-        setShuffleMode(if (_playbackState.value.shuffleMode == ShuffleMode.OFF) ShuffleMode.ON else ShuffleMode.OFF)
+        setShuffleMode(
+            if (_playbackState.value.shuffleMode == ShuffleMode.OFF) ShuffleMode.ON else ShuffleMode.OFF
+        )
 
     private fun cycleRepeatInternal() =
         setRepeatMode(when (_playbackState.value.repeatMode) {
@@ -418,14 +522,27 @@ class MusicService : MediaLibraryService() {
         })
 
     private fun toggleFavoriteInternal() {
-        val ps      = _playbackState.value
-        val song    = ps.currentSong ?: return
-        val updated = song.copy(isFavorite = !song.isFavorite)
-        val newQueue = ps.queue.map { if (it.id == song.id) updated else it }
-        _playbackState.value = ps.copy(currentSong = updated, queue = newQueue)
+        val ps   = _playbackState.value
+        val song = ps.currentSong ?: return
+        val upd  = song.copy(isFavorite = !song.isFavorite)
+        _playbackState.value = ps.copy(
+            currentSong = upd,
+            queue       = ps.queue.map { if (it.id == song.id) upd else it }
+        )
     }
 
-    // ── Notification tap intent ───────────────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private fun buildShuffledQueue(source: List<Song>, startIndex: Int): List<Song> {
+        if (source.isEmpty()) return source
+        val current = source[startIndex.coerceIn(0, source.size - 1)]
+        return listOf(current) + (source - current).shuffled()
+    }
+
+    private fun loadQueueIntoPlayer(queue: List<Song>, startIndex: Int) {
+        player.setMediaItems(queue.map { it.toMediaItem() }, startIndex, C.TIME_UNSET)
+        player.prepare()
+    }
 
     private fun buildTapIntent(): PendingIntent {
         val intent = Intent(this, MainActivity::class.java).apply {
@@ -438,8 +555,6 @@ class MusicService : MediaLibraryService() {
         )
     }
 
-    // ── Song → MediaItem ──────────────────────────────────────────────────────
-
     private fun Song.toMediaItem(): MediaItem =
         MediaItem.Builder()
             .setMediaId(id.toString())
@@ -450,11 +565,10 @@ class MusicService : MediaLibraryService() {
                     .setArtist(artist)
                     .setAlbumTitle(album)
                     .setDurationMs(duration)
+                    .setArtworkUri(albumArtUri)   // URI fallback for the system loader
                     .build()
             )
             .build()
-
-    // ── RepeatMode helpers ────────────────────────────────────────────────────
 
     private fun RepeatMode.toExoRepeat() = when (this) {
         RepeatMode.ONE  -> Player.REPEAT_MODE_ONE
@@ -462,26 +576,37 @@ class MusicService : MediaLibraryService() {
         RepeatMode.NONE -> Player.REPEAT_MODE_OFF
     }
 
-    // ── Colour helpers (kept from original) ───────────────────────────────────
-
     private fun scaleBitmap(src: Bitmap, maxSide: Int): Bitmap {
         val scale = maxSide.toFloat() / maxOf(src.width, src.height)
-        return Bitmap.createScaledBitmap(src, (src.width * scale).toInt(), (src.height * scale).toInt(), true)
+        return Bitmap.createScaledBitmap(
+            src,
+            (src.width  * scale).toInt().coerceAtLeast(1),
+            (src.height * scale).toInt().coerceAtLeast(1),
+            true
+        )
+    }
+
+    private fun bitmapToJpegBytes(bmp: Bitmap): ByteArray {
+        val out = java.io.ByteArrayOutputStream()
+        bmp.compress(Bitmap.CompressFormat.JPEG, 85, out)
+        return out.toByteArray()
     }
 
     private fun dominantColor(bmp: Bitmap): Int {
         val stepX = bmp.width  / 12f
         val stepY = bmp.height / 12f
         val hsv   = FloatArray(3)
-        val samples = (0..11).flatMap { r -> (0..11).map { c ->
-            bmp.getPixel((c * stepX).toInt(), (r * stepY).toInt())
-        }}
+        val samples = (0..11).flatMap { row ->
+            (0..11).map { col ->
+                bmp.getPixel((col * stepX).toInt(), (row * stepY).toInt())
+            }
+        }
         val vibrant = samples.sortedByDescending {
             Color.colorToHSV(it, hsv); hsv[1] * hsv[2]
         }.take(20)
-        val r = (vibrant.map { Color.red(it)   }.average() * 0.7).toInt()
-        val g = (vibrant.map { Color.green(it) }.average() * 0.7).toInt()
-        val b = (vibrant.map { Color.blue(it)  }.average() * 0.7).toInt()
+        val r = (vibrant.map { Color.red(it)   }.average() * 0.85).toInt().coerceIn(0, 255)
+        val g = (vibrant.map { Color.green(it) }.average() * 0.85).toInt().coerceIn(0, 255)
+        val b = (vibrant.map { Color.blue(it)  }.average() * 0.85).toInt().coerceIn(0, 255)
         return Color.rgb(r, g, b)
     }
 }
