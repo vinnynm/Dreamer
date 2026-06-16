@@ -25,6 +25,8 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.toRoute
 import com.enigma.devlyric.core.LyricFormat
 import com.enigma.dreamer.core.MusicUiState
+import com.enigma.dreamer.core.Playlist
+import com.enigma.dreamer.core.Song
 import kotlinx.serialization.Serializable
 import com.enigma.dreamer.ui.screens.LibraryScreen
 import com.enigma.dreamer.ui.screens.LyricEditorScreen
@@ -114,42 +116,62 @@ fun DevLyricApp(viewModel: MusicViewModel, openNowPlaying: Boolean = false) {
                 ) {
 
                     composable<LibraryRoute> {
+                        val songs           = state.songs
+                        val filteredSongs   = state.filteredSongs
+                        val playlists       = state.playlists
+                        val currentSong     = ps.currentSong
+                        val isPlaying       = ps.isPlaying
+                        val progress        = ps.progress
+
+                        val onSongClickRem = remember(viewModel, filteredSongs) {
+                            { song: Song ->
+                                viewModel.playSong(song, filteredSongs)
+                                navController.navigate(NowPlayingRoute)
+                            }
+                        }
+                        val onPlaylistClickRem = remember {
+                            { pl: Playlist -> navController.navigate(PlaylistDetailRoute(pl.id)) }
+                        }
+                        val onToggleFavoriteRem = remember { viewModel::toggleFavorite }
+                        val onEditLyricsRem = remember {
+                            { song: Song -> navController.navigate(LyricEditorRoute(song.id)) }
+                        }
+                        val onMiniPlayerClickRem = remember {
+                            { navController.navigate(NowPlayingRoute) }
+                        }
+                        val onPlayFavoritesRem = remember(viewModel, songs) {
+                            {
+                                val favs = songs.filter { it.isFavorite }
+                                if (favs.isNotEmpty()) {
+                                    viewModel.playSong(favs.first(), favs)
+                                    navController.navigate(NowPlayingRoute)
+                                }
+                            }
+                        }
+
                         LibraryScreen(
-                            songs               = state.songs,
-                            filteredSongs       = state.filteredSongs,
-                            playlists           = state.playlists,
+                            songs               = songs,
+                            filteredSongs       = filteredSongs,
+                            playlists           = playlists,
                             searchQuery         = state.searchQuery,
                             sortOrder           = state.sortOrder,
-                            currentSong         = ps.currentSong,
-                            isPlaying           = ps.isPlaying,
-                            playbackProgress    = ps.progress,
-                            onSongClick         = { song ->
-                                viewModel.playSong(song, state.filteredSongs)
-                                navController.navigate(NowPlayingRoute)
-                            },
-                            onPlaylistClick     = { pl ->
-                                navController.navigate(PlaylistDetailRoute(pl.id))
-                            },
+                            currentSong         = currentSong,
+                            isPlaying           = isPlaying,
+                            playbackProgress    = progress,
+                            onSongClick         = onSongClickRem,
+                            onPlaylistClick     = onPlaylistClickRem,
                             onSearch            = viewModel::search,
                             onSortChange        = viewModel::setSortOrder,
                             onCreatePlaylist    = viewModel::createPlaylist,
                             onDeletePlaylist    = viewModel::deletePlaylist,
                             onRenamePlaylist    = viewModel::renamePlaylist,
                             onAddSongToPlaylist = viewModel::addSongToPlaylist,
-                            onToggleFavorite    = viewModel::toggleFavorite,
+                            onToggleFavorite    = onToggleFavoriteRem,
                             onPlayNext          = viewModel::playNext,
                             onAddToQueue        = viewModel::addToQueue,
-                            onEditLyrics        = { song ->
-                                navController.navigate(LyricEditorRoute(song.id))
-                            },
-                            onPlayFavorites     = {
-                                val favs = state.songs.filter { it.isFavorite }
-                                if (favs.isNotEmpty()) {
-                                    viewModel.playSong(favs.first(), favs)
-                                    navController.navigate(NowPlayingRoute)
-                                }
-                            },
-                            onMiniPlayerClick   = { navController.navigate(NowPlayingRoute) },
+                            onEditLyrics        = onEditLyricsRem,
+                            onPlayFavorites     = onPlayFavoritesRem,
+                            onMiniPlayerClick   = onMiniPlayerClickRem,
                             onMiniPlayPause     = viewModel::togglePlayPause,
                             onMiniNext          = viewModel::next
                         )

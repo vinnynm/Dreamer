@@ -300,8 +300,24 @@ class MusicService : MediaLibraryService() {
     // ── Public API ────────────────────────────────────────────────────────────
 
     fun setQueue(queue: List<Song>, index: Int) {
+        val ps = _playbackState.value
+
+        // Optimization: If the queue is identical, just seek and play.
+        // This avoids rebuilding thousands of MediaItems when clicking in the same list.
+        if (queue === originalQueue || (queue.size == originalQueue.size && queue == originalQueue)) {
+            val song = queue.getOrNull(index)
+            val effectiveIdx = if (ps.shuffleMode == ShuffleMode.ON) {
+                ps.queue.indexOfFirst { it.id == song?.id }.coerceAtLeast(0)
+            } else index
+
+            if (player.currentMediaItemIndex != effectiveIdx) {
+                player.seekTo(effectiveIdx, 0L)
+            }
+            player.play()
+            return
+        }
+
         originalQueue = queue
-        val ps  = _playbackState.value
         val idx = index.coerceIn(0, (queue.size - 1).coerceAtLeast(0))
 
         val effectiveQueue = if (ps.shuffleMode == ShuffleMode.ON)

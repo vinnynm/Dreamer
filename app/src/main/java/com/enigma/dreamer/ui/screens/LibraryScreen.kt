@@ -64,80 +64,20 @@ fun LibraryScreen(
     var showSortSheet             by remember { mutableStateOf(false) }
     var detailSong                by remember { mutableStateOf<Song?>(null) }
 
+    val onLongClickRem      = remember { { song: Song -> detailSong = song } }
+    val onToggleFavoriteRem = remember(onToggleFavorite) { onToggleFavorite }
+
     Scaffold(
         containerColor = Amoled,
         topBar = {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .statusBarsPadding()
-                    .padding(horizontal = 16.dp)
-            ) {
-                Spacer(Modifier.height(16.dp))
-                Row(
-                    modifier          = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("DevLyric", style = MaterialTheme.typography.displayLarge,
-                        color = Amber, modifier = Modifier.weight(1f))
-                    if (selectedTab == 0) {
-                        IconButton(onClick = { showSortSheet = true }) {
-                            Icon(Icons.Filled.SortByAlpha, "Sort", tint = TextSecondary)
-                        }
-                    }
-                    if (selectedTab == 2) {
-                        IconButton(onClick = { showCreatePlaylistDialog = true }) {
-                            Icon(Icons.Filled.Add, "New playlist", tint = Amber)
-                        }
-                    }
-                }
-                Spacer(Modifier.height(12.dp))
-                OutlinedTextField(
-                    value         = searchQuery,
-                    onValueChange = onSearch,
-                    placeholder   = { Text("Search songs, artists…", color = TextMuted) },
-                    leadingIcon   = { Icon(Icons.Filled.Search, null, tint = TextMuted) },
-                    trailingIcon  = if (searchQuery.isNotBlank()) ({
-                        IconButton(onClick = { onSearch("") }) {
-                            Icon(Icons.Filled.Close, null, tint = TextMuted)
-                        }
-                    }) else null,
-                    modifier      = Modifier.fillMaxWidth(),
-                    shape         = RoundedCornerShape(16.dp),
-                    colors        = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor      = Amber,
-                        unfocusedBorderColor    = Surface3,
-                        focusedContainerColor   = Surface2,
-                        unfocusedContainerColor = Surface2,
-                        cursorColor             = Amber
-                    ),
-                    singleLine      = true,
-                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search)
-                )
-                Spacer(Modifier.height(12.dp))
-                TabRow(
-                    selectedTabIndex = selectedTab,
-                    containerColor   = Color.Transparent,
-                    contentColor     = Amber,
-                    indicator        = { positions ->
-                        TabRowDefaults.SecondaryIndicator(
-                            modifier = Modifier.tabIndicatorOffset(positions[selectedTab]),
-                            color    = Amber
-                        )
-                    }
-                ) {
-                    TABS.forEachIndexed { idx, label ->
-                        Tab(
-                            selected = selectedTab == idx,
-                            onClick  = { selectedTab = idx },
-                            text     = {
-                                Text(label,
-                                    color = if (selectedTab == idx) Amber else TextSecondary)
-                            }
-                        )
-                    }
-                }
-            }
+            LibraryTopBar(
+                selectedTab = selectedTab,
+                searchQuery = searchQuery,
+                onSearch = onSearch,
+                onSortClick = { showSortSheet = true },
+                onCreatePlaylistClick = { showCreatePlaylistDialog = true },
+                onTabSelect = { selectedTab = it }
+            )
         },
         bottomBar = {
             AnimatedVisibility(
@@ -158,25 +98,26 @@ fun LibraryScreen(
             }
         }
     ) { padding ->
+        val tabModifier = Modifier.padding(padding)
         when (selectedTab) {
             0 -> SongsTab(
                 songs            = filteredSongs,
                 currentSong      = currentSong,
                 isPlaying        = isPlaying,
                 onSongClick      = onSongClick,
-                onLongClick      = { detailSong = it },
-                onToggleFavorite = onToggleFavorite,
-                modifier         = Modifier.padding(padding)
+                onLongClick      = onLongClickRem,
+                onToggleFavorite = onToggleFavoriteRem,
+                modifier         = tabModifier
             )
             1 -> FavoritesTab(
                 songs            = songs,
                 currentSong      = currentSong,
                 isPlaying        = isPlaying,
                 onSongClick      = onSongClick,
-                onToggleFavorite = onToggleFavorite,
+                onToggleFavorite = onToggleFavoriteRem,
                 onPlayAll        = onPlayFavorites,
-                onLongClick      = { detailSong = it },
-                modifier         = Modifier.padding(padding)
+                onLongClick      = onLongClickRem,
+                modifier         = tabModifier
             )
             2 -> PlaylistsTab(
                 playlists        = playlists,
@@ -184,7 +125,7 @@ fun LibraryScreen(
                 onPlaylistClick  = onPlaylistClick,
                 onDeletePlaylist = onDeletePlaylist,
                 onRenamePlaylist = onRenamePlaylist,
-                modifier         = Modifier.padding(padding)
+                modifier         = tabModifier
             )
         }
     }
@@ -243,6 +184,90 @@ fun LibraryScreen(
             onToggleFavorite = { onToggleFavorite(song);    detailSong = null },
             onEditLyrics    = { onEditLyrics(song);         detailSong = null }  // NEW
         )
+    }
+}
+
+// ── Top Bar ──────────────────────────────────────────────────────────────────
+
+@Composable
+private fun LibraryTopBar(
+    selectedTab: Int,
+    searchQuery: String,
+    onSearch: (String) -> Unit,
+    onSortClick: () -> Unit,
+    onCreatePlaylistClick: () -> Unit,
+    onTabSelect: (Int) -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .statusBarsPadding()
+            .padding(horizontal = 16.dp)
+    ) {
+        Spacer(Modifier.height(16.dp))
+        Row(
+            modifier          = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("DevLyric", style = MaterialTheme.typography.displayLarge,
+                color = Amber, modifier = Modifier.weight(1f))
+            if (selectedTab == 0) {
+                IconButton(onClick = onSortClick) {
+                    Icon(Icons.Filled.SortByAlpha, "Sort", tint = TextSecondary)
+                }
+            }
+            if (selectedTab == 2) {
+                IconButton(onClick = onCreatePlaylistClick) {
+                    Icon(Icons.Filled.Add, "New playlist", tint = Amber)
+                }
+            }
+        }
+        Spacer(Modifier.height(12.dp))
+        OutlinedTextField(
+            value         = searchQuery,
+            onValueChange = onSearch,
+            placeholder   = { Text("Search songs, artists…", color = TextMuted) },
+            leadingIcon   = { Icon(Icons.Filled.Search, null, tint = TextMuted) },
+            trailingIcon  = if (searchQuery.isNotBlank()) ({
+                IconButton(onClick = { onSearch("") }) {
+                    Icon(Icons.Filled.Close, null, tint = TextMuted)
+                }
+            }) else null,
+            modifier      = Modifier.fillMaxWidth(),
+            shape         = RoundedCornerShape(16.dp),
+            colors        = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor      = Amber,
+                unfocusedBorderColor    = Surface3,
+                focusedContainerColor   = Surface2,
+                unfocusedContainerColor = Surface2,
+                cursorColor             = Amber
+            ),
+            singleLine      = true,
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search)
+        )
+        Spacer(Modifier.height(12.dp))
+        TabRow(
+            selectedTabIndex = selectedTab,
+            containerColor   = Color.Transparent,
+            contentColor     = Amber,
+            indicator        = { positions ->
+                TabRowDefaults.SecondaryIndicator(
+                    modifier = Modifier.tabIndicatorOffset(positions[selectedTab]),
+                    color    = Amber
+                )
+            }
+        ) {
+            TABS.forEachIndexed { idx, label ->
+                Tab(
+                    selected = selectedTab == idx,
+                    onClick  = { onTabSelect(idx) },
+                    text     = {
+                        Text(label,
+                            color = if (selectedTab == idx) Amber else TextSecondary)
+                    }
+                )
+            }
+        }
     }
 }
 
@@ -342,7 +367,11 @@ fun SongsTab(
                 color    = TextMuted,
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
         }
-        items(songs, key = { it.id }) { song ->
+        items(
+            items = songs,
+            key   = { it.id },
+            contentType = { "song" }
+        ) { song ->
             val favTint by animateColorAsState(
                 if (song.isFavorite) Amber else TextMuted, label = "fav${song.id}"
             )
@@ -394,7 +423,11 @@ fun PlaylistsTab(
         modifier       = modifier.fillMaxSize(),
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
     ) {
-        items(playlists, key = { it.id }) { playlist ->
+        items(
+            items = playlists,
+            key   = { it.id },
+            contentType = { "playlist" }
+        ) { playlist ->
             PlaylistItem(
                 playlist        = playlist,
                 songCount       = playlist.songIds.size,
