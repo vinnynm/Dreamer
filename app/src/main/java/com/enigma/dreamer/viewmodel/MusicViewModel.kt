@@ -28,7 +28,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     private val repo = SongRepository(application)
 
-    private val getSongsUseCase               = GetSongsUseCase(repo)
+    // Use-cases that haven't changed
     private val getPlaylistsUseCase           = GetPlaylistsUseCase(repo)
     private val searchSongsUseCase            = SearchSongsUseCase()
     private val sortSongsUseCase              = SortSongsUseCase(repo)
@@ -40,7 +40,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private val deletePlaylistUseCase         = DeletePlaylistUseCase(repo)
     private val renamePlaylistUseCase         = RenamePlaylistUseCase(repo)
 
-    // ── State ─────────────────────────────────────────────────────────────────
+    // ── UI State ──────────────────────────────────────────────────────────────
 
     private val _uiState = MutableStateFlow<MusicUiState>(MusicUiState.Loading)
     val uiState: StateFlow<MusicUiState> = _uiState.asStateFlow()
@@ -48,34 +48,31 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private val readyState: MusicUiState.Ready?
         get() = _uiState.value as? MusicUiState.Ready
 
+    // Scan progress exposed to UI — null = not scanning, 0..N = songs found so far
+    private val _scanProgress = MutableStateFlow<Int?>(null)
+    val scanProgress: StateFlow<Int?> = _scanProgress.asStateFlow()
+
+    // ── Color extraction guard (Phase 1 fix carried forward) ─────────────────
+    private var lastColorSongId: Long? = null
+
     // ── Service binding ───────────────────────────────────────────────────────
 
     private var musicService: MusicService? = null
-    private var positionJob:        Job? = null
-    private var playlistObserverJob:Job? = null
-    private var favoriteObserverJob:Job? = null
-
-    /**
-     * Track the last URI we extracted color from so we don't re-decode the same
-     * bitmap on every 500 ms position tick. Only re-extract when the song changes.
-     */
-    private var lastColorUri: Uri? = null
+    private var positionJob: Job? = null
+    private var playlistObserverJob: Job? = null
+    private var favoriteObserverJob: Job? = null
+    private var scanJob: Job? = null
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             val b = binder as MusicService.MusicBinder
             musicService = b.service
-
             viewModelScope.launch {
-                b.service.playbackState
-                    // Only propagate distinct song changes for color extraction,
-                    // but let all state changes reach the UI.
-                    .collect { ps -> updatePlayback(ps) }
+                b.service.playbackState.collect { ps -> updatePlayback(ps) }
             }
             startPositionTracking()
             readyState?.songs?.let { b.service.tryRestoreSession(it) }
         }
-
         override fun onServiceDisconnected(name: ComponentName) {
             musicService = null
             positionJob?.cancel()
@@ -92,24 +89,117 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         loadAll()
     }
 
+    // ── Two-phase load ────────────────────────────────────────────────────────
+
+    /**
+     * Phase A — cache read (~50–150 ms): load whatever is already in Room and
+     * show it immediately. The user sees their library almost instantly.
+     *
+     * Phase B — background scan: MediaStore query (metadata only, no file reads).
+     * Upserts new/changed songs, removes deleted ones. UI updates via the
+     * returned list, which we apply to state directly rather than waiting for
+     * the Flow observer to tick (avoids a redundant extra recompose).
+     *
+     * First-ever launch: cache is empty → we stay in Loading state and show a
+     * "Scanning…" indicator until Phase B completes, then transition to Ready.
+     * Subsequent launches: Phase A shows the library immediately; Phase B
+     * refreshes silently in the background.
+     */
     private fun loadAll() {
         viewModelScope.launch {
             _uiState.value = MusicUiState.Loading
+
             try {
-                val songs     = getSongsUseCase()
-                val playlists = getPlaylistsUseCase.loadAll()
-                _uiState.value = MusicUiState.Ready(
-                    songs         = songs,
-                    playlists     = playlists,
-                    filteredSongs = songs
-                )
-                observePlaylists()
-                observeFavorites()
-                musicService?.tryRestoreSession(songs)
+                // ── Phase A: instant cache read ───────────────────────────────
+                val playlists   = getPlaylistsUseCase.loadAll()
+                val cachedSongs = repo.loadSongsFromCache()
+
+                if (cachedSongs.isNotEmpty()) {
+                    // Show library immediately — no waiting for MediaStore
+                    _uiState.value = MusicUiState.Ready(
+                        songs         = cachedSongs,
+                        playlists     = playlists,
+                        filteredSongs = cachedSongs
+                    )
+                    observePlaylists()
+                    observeFavorites()
+                    musicService?.tryRestoreSession(cachedSongs)
+                }
+                // else: DB is empty (first launch), stay in Loading
+
+                // ── Phase B: background MediaStore scan ───────────────────────
+                launchBackgroundScan(firstLaunch = cachedSongs.isEmpty(), playlists = playlists)
+
             } catch (e: Exception) {
                 _uiState.value = MusicUiState.Error(e.message ?: "Failed to load songs")
             }
         }
+    }
+
+    /**
+     * Background scan — runs on IO dispatcher, never blocks the main thread.
+     * Updates UI state when complete.
+     *
+     * [firstLaunch] true  → We're in Loading state; transition to Ready when done.
+     * [firstLaunch] false → We're already in Ready; silently update songs list.
+     */
+    private fun launchBackgroundScan(firstLaunch: Boolean, playlists: List<Playlist> = emptyList()) {
+        scanJob?.cancel()
+        scanJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                _scanProgress.value = 0
+                val freshSongs = repo.scanAndSync()
+                _scanProgress.value = null
+
+                withContext(Dispatchers.Main) {
+                    if (firstLaunch) {
+                        // First launch: DB was empty, now we have songs — go Ready
+                        val pl = getPlaylistsUseCase.loadAll()
+                        _uiState.value = MusicUiState.Ready(
+                            songs         = freshSongs,
+                            playlists     = pl,
+                            filteredSongs = freshSongs
+                        )
+                        observePlaylists()
+                        observeFavorites()
+                        musicService?.tryRestoreSession(freshSongs)
+                    } else {
+                        // Subsequent launch: merge fresh data into existing Ready state
+                        mutateReady {
+                            // Preserve lyricDocument for any songs already loaded
+                            val lyricCache = songs
+                                .filter { it.lyricDocument != null }
+                                .associate { it.id to it.lyricDocument!! }
+
+                            val merged = freshSongs.map { song ->
+                                if (song.id in lyricCache)
+                                    song.copy(lyricDocument = lyricCache[song.id])
+                                else song
+                            }
+                            copy(
+                                songs         = merged,
+                                filteredSongs = searchSongsUseCase(merged, searchQuery)
+                            )
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                _scanProgress.value = null
+                // Scan failure is non-fatal if we already showed cached data
+                if (firstLaunch) {
+                    withContext(Dispatchers.Main) {
+                        _uiState.value = MusicUiState.Error(
+                            e.message ?: "Could not scan music library"
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /** Manual rescan triggered by pull-to-refresh or settings button. */
+    fun rescan() {
+        launchBackgroundScan(firstLaunch = false)
     }
 
     private fun observePlaylists() {
@@ -136,6 +226,33 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    // ── Lazy lyric loading ────────────────────────────────────────────────────
+
+    /**
+     * Called by the ViewModel when the user navigates to Now Playing.
+     * Loads lyrics for the current song if not already loaded.
+     * This is the ONLY place file bytes are read — never at scan time.
+     */
+    fun loadLyricsIfNeeded(song: Song) {
+        if (song.lyricDocument != null) return   // already loaded
+        viewModelScope.launch(Dispatchers.IO) {
+            val doc = repo.loadLyricsForSong(song) ?: return@launch
+            val updated = song.copy(lyricDocument = doc)
+            withContext(Dispatchers.Main) {
+                mutateReady {
+                    val newSongs = songs.map { if (it.id == song.id) updated else it }
+                    copy(
+                        songs         = newSongs,
+                        filteredSongs = searchSongsUseCase(newSongs, searchQuery),
+                        playbackState = if (playbackState.currentSong?.id == song.id)
+                            playbackState.copy(currentSong = updated)
+                        else playbackState
+                    )
+                }
+            }
+        }
+    }
+
     // ── Playback controls ─────────────────────────────────────────────────────
 
     fun playSong(song: Song, queue: List<Song> = readyState?.songs ?: listOf(song)) {
@@ -146,7 +263,9 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 isPlaying = true, bufferingState = BufferingState.PREPARING
             ))
         }
-        extractAndApplyColor(song.albumArtUri)
+        extractAndApplyColor(song.albumArtUri, song.id)
+        // Lazily load lyrics now that we know which song is playing
+        loadLyricsIfNeeded(song)
     }
 
     fun playPlaylist(playlist: Playlist) {
@@ -161,7 +280,10 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 bufferingState    = BufferingState.PREPARING
             ))
         }
-        songs.firstOrNull()?.albumArtUri?.let { extractAndApplyColor(it) }
+        songs.firstOrNull()?.let {
+            extractAndApplyColor(it.albumArtUri, it.id)
+            loadLyricsIfNeeded(it)
+        }
     }
 
     fun togglePlayPause() {
@@ -198,7 +320,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         mutateReady { copy(playbackState = playbackState.copy(playbackSpeed = speed)) }
     }
 
-    // ── Queue management ──────────────────────────────────────────────────────
+    // ── Queue ─────────────────────────────────────────────────────────────────
 
     fun toggleQueueView() {
         mutateReady { copy(showQueue = !showQueue) }
@@ -208,8 +330,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         val service = musicService ?: return
         val ps      = service.playbackState.value
         if (ps.queue.isEmpty()) { playSong(song); return }
-        val insertAt = (ps.queueIndex + 1).coerceAtMost(ps.queue.size)
-        service.insertIntoQueue(song, insertAt)
+        service.insertIntoQueue(song, (ps.queueIndex + 1).coerceAtMost(ps.queue.size))
         mutateReady {
             copy(playbackState = playbackState.copy(queue = service.playbackState.value.queue))
         }
@@ -237,18 +358,14 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 currentSong = song
             ))
         }
-        extractAndApplyColor(song.albumArtUri)
+        extractAndApplyColor(song.albumArtUri, song.id)
+        loadLyricsIfNeeded(song)
     }
 
     // ── Sleep timer ───────────────────────────────────────────────────────────
 
-    fun startSleepTimer(delayMinutes: Int) {
-        musicService?.startSleepTimer(delayMinutes * 60_000L)
-    }
-
-    fun cancelSleepTimer() {
-        musicService?.cancelSleepTimer()
-    }
+    fun startSleepTimer(delayMinutes: Int) { musicService?.startSleepTimer(delayMinutes * 60_000L) }
+    fun cancelSleepTimer()                 { musicService?.cancelSleepTimer() }
 
     // ── Favorites ─────────────────────────────────────────────────────────────
 
@@ -274,31 +391,15 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     // ── Playlists ─────────────────────────────────────────────────────────────
 
-    fun createPlaylist(name: String) {
-        viewModelScope.launch { createPlaylistUseCase(name) }
-    }
-
-    fun addSongToPlaylist(song: Song, playlistId: Long) {
-        viewModelScope.launch { addSongToPlaylistUseCase(song.id, playlistId) }
-    }
-
-    fun removeSongFromPlaylist(song: Song, playlistId: Long) {
-        viewModelScope.launch { removeSongFromPlaylistUseCase(song.id, playlistId) }
-    }
-
-    fun deletePlaylist(playlistId: Long) {
-        viewModelScope.launch { deletePlaylistUseCase(playlistId) }
-    }
-
-    fun renamePlaylist(playlistId: Long, newName: String) {
-        viewModelScope.launch { renamePlaylistUseCase(playlistId, newName) }
-    }
+    fun createPlaylist(name: String)                         { viewModelScope.launch { createPlaylistUseCase(name) } }
+    fun addSongToPlaylist(song: Song, playlistId: Long)      { viewModelScope.launch { addSongToPlaylistUseCase(song.id, playlistId) } }
+    fun removeSongFromPlaylist(song: Song, playlistId: Long) { viewModelScope.launch { removeSongFromPlaylistUseCase(song.id, playlistId) } }
+    fun deletePlaylist(playlistId: Long)                     { viewModelScope.launch { deletePlaylistUseCase(playlistId) } }
+    fun renamePlaylist(playlistId: Long, newName: String)    { viewModelScope.launch { renamePlaylistUseCase(playlistId, newName) } }
 
     // ── Lyrics ────────────────────────────────────────────────────────────────
 
-    fun toggleLyrics() {
-        mutateReady { copy(showLyrics = !showLyrics) }
-    }
+    fun toggleLyrics() { mutateReady { copy(showLyrics = !showLyrics) } }
 
     fun bakeLyricsToSong(
         song: Song,
@@ -310,31 +411,13 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val doc = repo.bakeLyrics(song.filePath, lyricText, format)
                 if (doc != null) {
-                    val updated = song.copy(lyricDocument = doc)
-                    mutateReady {
-                        val newSongs = songs.map { if (it.id == song.id) updated else it }
-                        copy(
-                            songs         = newSongs,
-                            filteredSongs = searchSongsUseCase(newSongs, searchQuery),
-                            playbackState = if (playbackState.currentSong?.id == song.id)
-                                playbackState.copy(currentSong = updated) else playbackState
-                        )
-                    }
+                    applyUpdatedLyrics(song, doc)
                     onResult(true, "Lyrics baked into ${song.title}")
                 } else {
                     val sidecarOk = repo.saveSidecarLrc(song.filePath, lyricText)
                     if (sidecarOk) {
-                        val parsed  = LyricParser.parse(lyricText, format)
-                        val updated = song.copy(lyricDocument = parsed)
-                        mutateReady {
-                            val newSongs = songs.map { if (it.id == song.id) updated else it }
-                            copy(
-                                songs         = newSongs,
-                                filteredSongs = searchSongsUseCase(newSongs, searchQuery),
-                                playbackState = if (playbackState.currentSong?.id == song.id)
-                                    playbackState.copy(currentSong = updated) else playbackState
-                            )
-                        }
+                        val parsed = LyricParser.parse(lyricText, format)
+                        applyUpdatedLyrics(song, parsed)
                         onResult(true, "Saved as sidecar .lrc file")
                     } else {
                         onResult(false, "Could not write lyrics — check storage permission")
@@ -346,24 +429,29 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun applyUpdatedLyrics(song: Song, doc: LyricDocument) {
+        val updated = song.copy(lyricDocument = doc)
+        mutateReady {
+            val newSongs = songs.map { if (it.id == song.id) updated else it }
+            copy(
+                songs         = newSongs,
+                filteredSongs = searchSongsUseCase(newSongs, searchQuery),
+                playbackState = if (playbackState.currentSong?.id == song.id)
+                    playbackState.copy(currentSong = updated)
+                else playbackState
+            )
+        }
+    }
+
     fun clearError() {
         mutateReady { copy(playbackState = playbackState.copy(error = null)) }
     }
 
-    // ── Dynamic album-art colour ──────────────────────────────────────────────
+    // ── Dynamic colour ────────────────────────────────────────────────────────
 
-    /**
-     * Extracts dominant + contrast colors from [artUri] and pushes them into
-     * [MusicUiState.Ready.dominantColor] / [accentTextColor].
-     *
-     * Guards against duplicate decodes: if [artUri] is the same as the last
-     * call we skip the IO entirely. This is important because [updatePlayback]
-     * is called on every ExoPlayer state tick, not just song changes.
-     */
-    fun extractAndApplyColor(artUri: Uri?) {
-        if (artUri == lastColorUri) return      // ← prevents 500 ms decode storm
-        lastColorUri = artUri
-
+    fun extractAndApplyColor(artUri: Uri?, songId: Long) {
+        if (songId == lastColorSongId) return
+        lastColorSongId = songId
         viewModelScope.launch(Dispatchers.IO) {
             val bitmap = artUri?.let { uri ->
                 runCatching {
@@ -375,43 +463,29 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             val contrast = contrastColor(dominant)
             withContext(Dispatchers.Main) {
                 mutateReady { copy(dominantColor = dominant, accentTextColor = contrast) }
-                // Pass the pre-computed accent color so MusicService doesn't
-                // need to run its own (formerly inconsistent) sampling algorithm.
                 bitmap?.let { musicService?.updateAlbumArt(it, dominant) }
             }
         }
     }
 
-    /**
-     * Single, shared dominant-color algorithm.
-     * Samples a 12×12 grid, picks the 20 most vibrant pixels, and averages them
-     * at 70% brightness so the result works as a dark background.
-     *
-     * Previously duplicated (with different multipliers: 0.85 in MusicService,
-     * 0.70 here) — consolidated here, MusicService now calls [updateAlbumArt]
-     * after we've already derived the color so it only needs the bitmap.
-     */
     private fun dominantColor(bmp: android.graphics.Bitmap): Int {
         val stepX   = bmp.width  / 12f
         val stepY   = bmp.height / 12f
         val hsv     = FloatArray(3)
-        // Pre-size the list to avoid repeated resizing
-        val samples = ArrayList<Int>(144).apply {
-            for (row in 0..11) for (col in 0..11)
-                add(bmp.getPixel((col * stepX).toInt(), (row * stepY).toInt()))
+        val samples = (0..11).flatMap { row ->
+            (0..11).map { col -> bmp.getPixel((col * stepX).toInt(), (row * stepY).toInt()) }
         }
         val vibrant = samples.sortedByDescending {
             Color.colorToHSV(it, hsv); hsv[1] * hsv[2]
         }.take(20)
-        val r = (vibrant.sumOf { Color.red(it)   } / 20.0 * 0.70).toInt().coerceIn(0, 255)
-        val g = (vibrant.sumOf { Color.green(it) } / 20.0 * 0.70).toInt().coerceIn(0, 255)
-        val b = (vibrant.sumOf { Color.blue(it)  } / 20.0 * 0.70).toInt().coerceIn(0, 255)
+        val r = (vibrant.map { Color.red(it)   }.average() * 0.7).toInt().coerceIn(0, 255)
+        val g = (vibrant.map { Color.green(it) }.average() * 0.7).toInt().coerceIn(0, 255)
+        val b = (vibrant.map { Color.blue(it)  }.average() * 0.7).toInt().coerceIn(0, 255)
         return Color.rgb(r, g, b)
     }
 
     private fun contrastColor(bgColor: Int): Int {
-        fun lin(c: Double) = if (c <= 0.04045) c / 12.92
-        else Math.pow((c + 0.055) / 1.055, 2.4)
+        fun lin(c: Double) = if (c <= 0.04045) c / 12.92 else Math.pow((c + 0.055) / 1.055, 2.4)
         val lum = 0.2126 * lin(Color.red(bgColor)   / 255.0) +
                 0.7152 * lin(Color.green(bgColor)  / 255.0) +
                 0.0722 * lin(Color.blue(bgColor)   / 255.0)
@@ -449,20 +523,16 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         return last
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    // ── Internal helpers ──────────────────────────────────────────────────────
 
-    /**
-     * Called from the service collector on every [PlaybackState] update.
-     * We only trigger color extraction when the song actually changes —
-     * not on every isPlaying/position change.
-     */
     private fun updatePlayback(ps: PlaybackState) {
-        val previousSongId = readyState?.playbackState?.currentSong?.id
         mutateReady { copy(playbackState = ps) }
-        // Only re-extract art color when the track actually changed
-        if (ps.currentSong?.id != previousSongId) {
-            ps.currentSong?.albumArtUri?.let { extractAndApplyColor(it) }
+        val song = ps.currentSong ?: return
+        if (song.id != lastColorSongId) {
+            extractAndApplyColor(song.albumArtUri, song.id)
         }
+        // Load lyrics for the newly playing song if not already in memory
+        loadLyricsIfNeeded(song)
     }
 
     private fun mutateReady(block: MusicUiState.Ready.() -> MusicUiState.Ready) {
@@ -478,6 +548,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         positionJob?.cancel()
         playlistObserverJob?.cancel()
         favoriteObserverJob?.cancel()
+        scanJob?.cancel()
         getApplication<Application>().unbindService(serviceConnection)
     }
 

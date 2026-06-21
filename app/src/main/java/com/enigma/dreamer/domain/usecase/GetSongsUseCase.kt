@@ -4,5 +4,5 @@ import com.enigma.dreamer.core.Song
 import com.enigma.dreamer.core.SongRepository
 
 class GetSongsUseCase(private val repository: SongRepository) {
-    suspend operator fun invoke(): List<Song> = repository.loadSongs()
+    suspend operator fun invoke(): List<Song> = repository.loadSongsFromCache()
 }

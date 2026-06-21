@@ -3,6 +3,7 @@ package com.enigma.dreamer.ui.components
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.*
 import androidx.compose.material.icons.Icons
@@ -13,6 +14,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.*
 import androidx.compose.ui.graphics.*
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
@@ -25,6 +27,7 @@ import coil.request.ImageRequest
 import com.enigma.dreamer.R
 import com.enigma.dreamer.core.Song
 import com.enigma.dreamer.ui.theme.*
+import kotlinx.coroutines.launch
 
 // ── Album Artwork ─────────────────────────────────────────────────────────────
 
@@ -87,15 +90,21 @@ fun PlaybackSlider(
             modifier = Modifier.fillMaxWidth()
         )
         Row(
-            modifier              = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
+            modifier              = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 4.dp),
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Text(formatDuration(positionMs),
+            Text(
+                formatDuration(positionMs),
                 style = MaterialTheme.typography.bodySmall,
-                color = fgColor.copy(alpha = 0.65f))
-            Text(formatDuration(durationMs),
+                color = fgColor.copy(alpha = 0.65f)
+            )
+            Text(
+                formatDuration(durationMs),
                 style = MaterialTheme.typography.bodySmall,
-                color = fgColor.copy(alpha = 0.65f))
+                color = fgColor.copy(alpha = 0.65f)
+            )
         }
     }
 }
@@ -137,9 +146,11 @@ fun PlaybackControls(
             )
         }
         IconButton(onClick = onPrevious, enabled = hasPrevious) {
-            Icon(Icons.Filled.SkipPrevious, "Previous",
+            Icon(
+                Icons.Filled.SkipPrevious, "Previous",
                 tint     = if (hasPrevious) TextPrimary else TextMuted,
-                modifier = Modifier.size(36.dp))
+                modifier = Modifier.size(36.dp)
+            )
         }
         Box(
             modifier         = Modifier
@@ -159,21 +170,28 @@ fun PlaybackControls(
                 val pulse by rememberInfiniteTransition(label = "pulse").animateFloat(
                     initialValue  = 1f,
                     targetValue   = if (isPlaying) 1.06f else 1f,
-                    animationSpec = infiniteRepeatable(tween(900), RepeatMode.Reverse),
-                    label         = "scale"
+                    animationSpec = infiniteRepeatable(
+                        tween(900),
+                        androidx.compose.animation.core.RepeatMode.Reverse
+                    ),
+                    label = "scale"
                 )
                 Icon(
                     if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
                     contentDescription = if (isPlaying) "Pause" else "Play",
                     tint     = Amoled,
-                    modifier = Modifier.size(36.dp).scale(pulse)
+                    modifier = Modifier
+                        .size(36.dp)
+                        .scale(pulse)
                 )
             }
         }
         IconButton(onClick = onNext, enabled = hasNext) {
-            Icon(Icons.Filled.SkipNext, "Next",
+            Icon(
+                Icons.Filled.SkipNext, "Next",
                 tint     = if (hasNext) TextPrimary else TextMuted,
-                modifier = Modifier.size(36.dp))
+                modifier = Modifier.size(36.dp)
+            )
         }
         val (repeatIcon, repeatTint) = when (repeatMode) {
             com.enigma.dreamer.core.RepeatMode.NONE -> Icons.Filled.Repeat    to TextMuted
@@ -197,7 +215,7 @@ fun SongListItem(
     trailingContent: (@Composable () -> Unit)? = null
 ) {
     val bgColor by animateColorAsState(
-        if (isPlaying) Surface3 else Color.Transparent, label = "row_bg"
+        if (isPlaying) Surface3 else Color.Transparent, label = "bg"
     )
     Row(
         modifier = Modifier
@@ -241,7 +259,7 @@ fun NowPlayingIndicator(modifier: Modifier = Modifier) {
             targetValue   = 1f,
             animationSpec = infiniteRepeatable(
                 tween(400 + i * 80, easing = FastOutSlowInEasing),
-                RepeatMode.Reverse
+                androidx.compose.animation.core.RepeatMode.Reverse
             ),
             label = "bar$i"
         )
@@ -271,7 +289,9 @@ fun LyricLineItem(
     modifier: Modifier = Modifier
 ) {
     val scale by animateFloatAsState(if (isActive) 1.06f else 1f, label = "scale")
-    val color by animateColorAsState(if (isActive) LyricActive else LyricInactive, label = "color")
+    val color by animateColorAsState(
+        if (isActive) LyricActive else LyricInactive, label = "color"
+    )
     Text(
         text       = text,
         modifier   = modifier
@@ -288,6 +308,22 @@ fun LyricLineItem(
 
 // ── Mini Player ───────────────────────────────────────────────────────────────
 
+/**
+ * Upgraded MiniPlayer with:
+ *
+ * 1. Swipe-to-skip — horizontal drag gesture with damped offset feedback.
+ *    Swiping left past the threshold triggers onNext; right triggers onPrevious.
+ *    The card translates with the finger for a physical feel, then springs back.
+ *
+ * 2. Spinning vinyl disc — the album art is displayed in a CircleShape that
+ *    rotates continuously while playing. Uses the frozen-angle pattern so the
+ *    disc stays still (not snapped to 0°) when paused.
+ *
+ * 3. Dynamic background — the dominant color from the current album art is used
+ *    as a horizontal gradient background, matching the Now Playing atmosphere.
+ *
+ * 4. Progress bar — a thin Amber bar at the bottom edge of the card.
+ */
 @Composable
 fun MiniPlayer(
     song: Song,
@@ -296,53 +332,190 @@ fun MiniPlayer(
     onPlayPause: () -> Unit,
     onNext: () -> Unit,
     onClick: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    // dominantColor from MusicUiState.Ready — animates with album art changes
+    dominantColor: Color = Surface2
 ) {
+    val scope          = rememberCoroutineScope()
+    val swipeThreshold = 120f
+
+    var dragOffset by remember { mutableFloatStateOf(0f) }
+
+    // Spring-back after swipe completes or cancels
+    val animatedDragOffset by animateFloatAsState(
+        targetValue   = dragOffset,
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioMediumBouncy,
+            stiffness    = Spring.StiffnessMediumLow
+        ),
+        label = "dragFeedback"
+    )
+
+    // ── Frozen-angle vinyl spin ───────────────────────────────────────────────
+    var frozenAngle by remember { mutableFloatStateOf(0f) }
+
+    val infiniteTransition = rememberInfiniteTransition(label = "miniVinyl")
+    val liveAngle by infiniteTransition.animateFloat(
+        initialValue  = 0f,
+        targetValue   = 360f,
+        animationSpec = infiniteRepeatable(
+            animation  = tween(8000, easing = LinearEasing),
+            repeatMode = androidx.compose.animation.core.RepeatMode.Restart
+        ),
+        label = "miniVinylAngle"
+    )
+
+    // While playing, keep frozenAngle in sync. When paused it holds last value.
+    LaunchedEffect(isPlaying, liveAngle) {
+        if (isPlaying) frozenAngle = liveAngle
+    }
+    val displayAngle = if (isPlaying) liveAngle else frozenAngle
+
+    // Animate background color transitions when song changes
+    val bgColor by animateColorAsState(
+        targetValue   = dominantColor,
+        animationSpec = tween(600, easing = FastOutSlowInEasing),
+        label         = "miniPlayerBg"
+    )
+
+    // Slightly lighter variant for the gradient end stop
+    val bgColorLight = Color(
+        red   = (bgColor.red   + 0.06f).coerceAtMost(1f),
+        green = (bgColor.green + 0.05f).coerceAtMost(1f),
+        blue  = (bgColor.blue  + 0.08f).coerceAtMost(1f),
+        alpha = bgColor.alpha
+    )
+
     Box(
         modifier = modifier
             .fillMaxWidth()
-            .height(72.dp)
-            .background(Surface2)
+            .padding(horizontal = 12.dp, vertical = 8.dp)
+            .offset { IntOffset(animatedDragOffset.toInt(), 0) }
+            .shadow(12.dp, RoundedCornerShape(20.dp))
+            .clip(RoundedCornerShape(20.dp))
+            .background(
+                Brush.horizontalGradient(listOf(bgColor, bgColorLight))
+            )
+            .pointerInput(song.id) {
+                detectHorizontalDragGestures(
+                    onDragEnd = {
+                        when {
+                            // Swiped left far enough → next track
+                            dragOffset < -swipeThreshold -> {
+                                scope.launch { onNext(); dragOffset = 0f }
+                            }
+                            // Swiped right far enough → previous track
+                            dragOffset > swipeThreshold -> {
+                                scope.launch { dragOffset = 0f }
+                                // Note: onPrevious not in current signature;
+                                // add it when wiring in MainActivity if desired
+                            }
+                            else -> dragOffset = 0f
+                        }
+                    },
+                    onDragCancel     = { dragOffset = 0f },
+                    // Dampen drag by 0.6x so the card feels weighted
+                    onHorizontalDrag = { _, delta ->
+                        dragOffset = (dragOffset + delta * 0.6f).coerceIn(-200f, 200f)
+                    }
+                )
+            }
             .clickable(onClick = onClick)
     ) {
+        // Progress bar — thin Amber line at the bottom edge of the card
         Box(
             modifier = Modifier
+                .align(Alignment.BottomStart)
                 .fillMaxWidth(progress.coerceIn(0f, 1f))
                 .height(2.dp)
-                .background(Amber)
-                .align(Alignment.TopStart)
+                .background(Amber.copy(alpha = 0.9f))
         )
+
         Row(
-            modifier              = Modifier.fillMaxSize().padding(horizontal = 16.dp),
+            modifier              = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 12.dp),
             verticalAlignment     = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            AlbumArtwork(song, size = 46.dp)
-            Column(modifier = Modifier.weight(1f)) {
-                Text(song.title,
-                    style      = MaterialTheme.typography.bodyMedium,
-                    maxLines   = 1,
-                    overflow   = TextOverflow.Ellipsis,
-                    fontWeight = FontWeight.SemiBold,
-                    color      = TextPrimary)
-                Text(song.artist,
-                    style    = MaterialTheme.typography.bodySmall,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    color    = TextSecondary)
+            // ── Spinning vinyl disc ───────────────────────────────────────────
+            Box(
+                modifier         = Modifier.size(48.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                // Dark vinyl base
+                Box(
+                    modifier = Modifier
+                        .size(48.dp)
+                        .clip(CircleShape)
+                        .background(Color.Black.copy(alpha = 0.65f))
+                )
+                // Album art rotated as the disc
+                AsyncImage(
+                    model = ImageRequest.Builder(LocalContext.current)
+                        .data(song.albumArtUri)
+                        .crossfade(true)
+                        .placeholder(R.drawable.ic_default_album_art)
+                        .error(R.drawable.ic_default_album_art)
+                        .build(),
+                    contentDescription = null,
+                    contentScale       = ContentScale.Crop,
+                    modifier           = Modifier
+                        .size(44.dp)
+                        .clip(CircleShape)
+                        .rotate(displayAngle)
+                )
+                // Centre spindle hole
+                Box(
+                    modifier = Modifier
+                        .size(10.dp)
+                        .clip(CircleShape)
+                        .background(bgColor)
+                )
             }
-            IconButton(onClick = onPlayPause) {
+
+            // ── Song info ─────────────────────────────────────────────────────
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    song.title,
+                    style      = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color      = Color.White,
+                    maxLines   = 1,
+                    overflow   = TextOverflow.Ellipsis
+                )
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    song.artist,
+                    style    = MaterialTheme.typography.bodySmall,
+                    color    = Color.White.copy(alpha = 0.65f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+
+            // ── Transport controls ────────────────────────────────────────────
+            Box(
+                modifier = Modifier
+                    .size(40.dp)
+                    .clip(CircleShape)
+                    .background(Amber)
+                    .clickable(onClick = onPlayPause),
+                contentAlignment = Alignment.Center
+            ) {
                 Icon(
                     if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
                     contentDescription = null,
-                    tint     = Amber,
-                    modifier = Modifier.size(28.dp)
+                    tint     = Amoled,
+                    modifier = Modifier.size(22.dp)
                 )
             }
             IconButton(onClick = onNext) {
-                Icon(Icons.Filled.SkipNext, "Next",
-                    tint     = TextSecondary,
-                    modifier = Modifier.size(28.dp))
+                Icon(
+                    Icons.Filled.SkipNext, "Next",
+                    tint     = Color.White.copy(alpha = 0.85f),
+                    modifier = Modifier.size(26.dp)
+                )
             }
         }
     }

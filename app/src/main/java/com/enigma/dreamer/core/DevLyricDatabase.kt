@@ -38,8 +38,6 @@ data class FavoriteEntity(
     val addedAt: Long = System.currentTimeMillis()
 )
 
-// ── Flat result type for batch playlist+song-id query (eliminates N+1) ────────
-
 data class PlaylistWithSongIds(
     val playlistId: Long,
     val name: String,
@@ -120,59 +118,83 @@ interface FavoriteDao {
 
 // ── Database ──────────────────────────────────────────────────────────────────
 
-/**
- * Migration v1 → v2.
- *
- * FIX: the original database used `fallbackToDestructiveMigration()`, which
- * silently DROPS AND RECREATES every table whenever the schema version bumps —
- * meaning every user's favorites and playlists would have been wiped on the
- * v1→v2 upgrade (and on any future bump) with zero warning to the user.
- *
- * The actual v1→v2 change here was adding autoGenerate to `playlists.id`.
- * SQLite can't ALTER a PRIMARY KEY's autoincrement behavior in place, so the
- * standard pattern is: rename the old table, recreate with the new schema,
- * copy data across, drop the old table. This preserves existing playlists,
- * cross-refs, and favorites instead of deleting them.
- *
- * If you don't actually have any v1 installs in the wild (e.g. this is still
- * pre-release), you can simplify this back to a plain destructive migration,
- * but doing so deliberately is safer than the implicit fallback.
- */
-private val MIGRATION_1_2 = object : Migration(1, 2) {
-    override fun migrate(db: SupportSQLiteDatabase) {
-        db.execSQL("ALTER TABLE playlists RENAME TO playlists_old")
-        db.execSQL(
-            """
-            CREATE TABLE playlists (
-                id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-                name TEXT NOT NULL,
-                createdAt INTEGER NOT NULL
-            )
-            """.trimIndent()
-        )
-        db.execSQL(
-            """
-            INSERT INTO playlists (id, name, createdAt)
-            SELECT id, name, createdAt FROM playlists_old
-            """.trimIndent()
-        )
-        db.execSQL("DROP TABLE playlists_old")
-        // playlist_songs / favorites are unaffected by this particular change,
-        // so no migration needed for them.
-    }
-}
-
 @Database(
-    entities     = [PlaylistEntity::class, PlaylistSongCrossRef::class, FavoriteEntity::class],
-    version      = 2,
+    entities     = [
+        PlaylistEntity::class,
+        PlaylistSongCrossRef::class,
+        FavoriteEntity::class,
+        SongEntity::class          // NEW in v3
+    ],
+    version      = 3,
     exportSchema = false
 )
 abstract class DevLyricDatabase : RoomDatabase() {
     abstract fun playlistDao(): PlaylistDao
     abstract fun favoriteDao(): FavoriteDao
+    abstract fun songDao(): SongDao        // NEW in v3
 
     companion object {
         @Volatile private var INSTANCE: DevLyricDatabase? = null
+
+        /**
+         * v1 → v2: playlists.id switched to autoGenerate.
+         * Clean slate — drops and recreates playlists + playlist_songs.
+         */
+        private val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("DROP TABLE IF EXISTS playlist_songs")
+                db.execSQL("DROP TABLE IF EXISTS playlists")
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS playlists (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        name TEXT NOT NULL,
+                        createdAt INTEGER NOT NULL
+                    )
+                """.trimIndent())
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS playlist_songs (
+                        playlistId INTEGER NOT NULL,
+                        songId INTEGER NOT NULL,
+                        position INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY(playlistId, songId),
+                        FOREIGN KEY(playlistId) REFERENCES playlists(id) ON DELETE CASCADE
+                    )
+                """.trimIndent())
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_playlist_songs_playlistId ON playlist_songs(playlistId)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_playlist_songs_songId ON playlist_songs(songId)")
+            }
+        }
+
+        /**
+         * v2 → v3: adds the songs table for the MediaStore cache.
+         * No existing data is touched — playlists and favorites survive intact.
+         */
+        private val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS songs (
+                        id INTEGER PRIMARY KEY NOT NULL,
+                        title TEXT NOT NULL,
+                        artist TEXT NOT NULL,
+                        album TEXT NOT NULL,
+                        duration INTEGER NOT NULL,
+                        uri TEXT NOT NULL,
+                        albumArtUri TEXT,
+                        isFavorite INTEGER NOT NULL DEFAULT 0,
+                        year INTEGER NOT NULL DEFAULT 0,
+                        trackNumber INTEGER NOT NULL DEFAULT 0,
+                        filePath TEXT NOT NULL DEFAULT '',
+                        fileSize INTEGER NOT NULL DEFAULT 0,
+                        mimeType TEXT NOT NULL DEFAULT '',
+                        hasLyricHint INTEGER NOT NULL DEFAULT 0
+                    )
+                """.trimIndent())
+                // Index for the common sort order used in LibraryScreen
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_songs_title ON songs(title ASC)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_songs_artist ON songs(artist ASC)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_songs_isFavorite ON songs(isFavorite)")
+            }
+        }
 
         fun getInstance(context: Context): DevLyricDatabase =
             INSTANCE ?: synchronized(this) {
@@ -181,11 +203,7 @@ abstract class DevLyricDatabase : RoomDatabase() {
                     DevLyricDatabase::class.java,
                     "devlyric.db"
                 )
-                    .addMigrations(MIGRATION_1_2)
-                    // Destructive fallback now only triggers if a migration path
-                    // is truly missing (e.g. very old installs predating v1),
-                    // not as the default behavior for every bump.
-                    .fallbackToDestructiveMigrationOnDowngrade()
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
                     .build()
                     .also { INSTANCE = it }
             }

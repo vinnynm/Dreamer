@@ -18,17 +18,24 @@ import androidx.compose.ui.geometry.center
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.*
+import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import com.enigma.dreamer.R
 import com.enigma.dreamer.core.BufferingState
 import com.enigma.dreamer.core.PlaybackState
-import com.enigma.dreamer.core.RepeatMode as AppRepeatMode   // ← disambiguate from animation RepeatMode
+import com.enigma.dreamer.core.RepeatMode as AppRepeatMode
+import com.enigma.dreamer.core.Song
 import com.enigma.dreamer.ui.components.AlbumArtwork
 import com.enigma.dreamer.ui.components.LyricLineItem
 import com.enigma.dreamer.ui.components.PlaybackControls
 import com.enigma.dreamer.ui.components.PlaybackSlider
+import com.enigma.dreamer.ui.components.formatDuration
 import com.enigma.dreamer.ui.theme.*
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -38,7 +45,7 @@ fun NowPlayingScreen(
     currentLyricLine: Int,
     showLyrics: Boolean,
     showQueue: Boolean,
-    dominantColor:   Int = 0xFF0D0D0D.toInt(),
+    dominantColor: Int = 0xFF0D0D0D.toInt(),
     accentTextColor: Int = 0xFFEEEEEE.toInt(),
     onPlayPause: () -> Unit,
     onNext: () -> Unit,
@@ -77,18 +84,48 @@ fun NowPlayingScreen(
         }
     }
 
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(
-                Brush.verticalGradient(
-                    0.00f to bgColor.copy(alpha = 0.95f),
-                    0.50f to bgColor.copy(alpha = 0.55f),
-                    1.00f to Amoled
+    // "Next up" song — the item after the current queue index
+    val nextSong: Song? = remember(playbackState.queue, playbackState.queueIndex) {
+        playbackState.queue.getOrNull(playbackState.queueIndex + 1)
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+
+        // ── Layer 1: blurred album art atmosphere ─────────────────────────────
+        // Renders the album art at full screen size with a heavy blur so the
+        // dominant hues bleed into the background without distracting from the
+        // content. The gradient overlay on Layer 2 controls opacity.
+        AsyncImage(
+            model = ImageRequest.Builder(LocalContext.current)
+                .data(song.albumArtUri)
+                .crossfade(true)
+                .placeholder(R.drawable.ic_default_album_art)
+                .error(R.drawable.ic_default_album_art)
+                .build(),
+            contentDescription = null,
+            contentScale       = ContentScale.Crop,
+            modifier           = Modifier
+                .fillMaxSize()
+                .blur(60.dp)           // heavy blur — only color/mood leaks through
+        )
+
+        // ── Layer 2: dominant-color gradient overlay ──────────────────────────
+        // Sits on top of the blur. The gradient is dark at top and bottom so
+        // controls are always legible regardless of album art color.
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        0.00f to bgColor.copy(alpha = 0.88f),
+                        0.35f to bgColor.copy(alpha = 0.72f),
+                        0.65f to bgColor.copy(alpha = 0.72f),
+                        1.00f to Amoled.copy(alpha = 0.97f)
+                    )
                 )
-            )
-    ) {
-        // ── Queue overlay ─────────────────────────────────────────────────────
+        )
+
+        // ── Layer 3: Queue overlay ────────────────────────────────────────────
         AnimatedVisibility(
             visible = showQueue,
             enter   = slideInVertically { it },
@@ -102,6 +139,7 @@ fun NowPlayingScreen(
             )
         }
 
+        // ── Layer 4: main content ─────────────────────────────────────────────
         if (!showQueue) {
             Column(
                 modifier = Modifier
@@ -172,15 +210,16 @@ fun NowPlayingScreen(
                     }
                 }
 
-                // ── Art or Lyrics ─────────────────────────────────────────────
+                // ── Artwork or Lyrics ─────────────────────────────────────────
                 if (!showLyrics || song.lyricDocument == null) {
-                    Spacer(Modifier.weight(0.35f))
+                    Spacer(Modifier.weight(0.3f))
 
                     val artScale by animateFloatAsState(
                         if (playbackState.isPlaying) 1f else 0.88f,
                         animationSpec = spring(Spring.DampingRatioMediumBouncy),
                         label         = "artScale"
                     )
+
                     Box(
                         modifier         = Modifier
                             .align(Alignment.CenterHorizontally)
@@ -188,39 +227,35 @@ fun NowPlayingScreen(
                         contentAlignment = Alignment.Center
                     ) {
                         val artShape = RoundedCornerShape(16.dp)
+
+                        // Glow shadow
                         Box(
                             modifier = Modifier
                                 .size(260.dp)
                                 .shadow(
-                                    elevation    = if (playbackState.isPlaying) 30.dp else 10.dp,
+                                    elevation    = if (playbackState.isPlaying) 32.dp else 10.dp,
                                     shape        = artShape,
                                     ambientColor = bgColor,
                                     spotColor    = bgColor
                                 )
                         )
 
-                        // ── Vinyl disk ─────────────────────────────────────────
-                        // Use infiniteRepeatable with LinearEasing so the rotation
-                        // accumulates continuously — no visual snap back to 0°.
-                        val infiniteTransition = rememberInfiniteTransition(label = "vinyl")
-                        val diskRotation by infiniteTransition.animateFloat(
+                        // ── Vinyl disc (frozen-angle) ─────────────────────────
+                        var frozenAngle by remember { mutableFloatStateOf(0f) }
+                        val infiniteTransition = rememberInfiniteTransition(label = "vinylSpin")
+                        val liveAngle by infiniteTransition.animateFloat(
                             initialValue  = 0f,
                             targetValue   = 360f,
                             animationSpec = infiniteRepeatable(
-                                // RepeatMode here is androidx.compose.animation.core.RepeatMode
-                                animation  = tween(durationMillis = 3000, easing = LinearEasing),
-                                repeatMode = RepeatMode.Restart          // compose animation RepeatMode
+                                animation  = tween(3000, easing = LinearEasing),
+                                repeatMode = androidx.compose.animation.core.RepeatMode.Restart
                             ),
-                            label = "diskRotation"
+                            label = "diskLiveAngle"
                         )
-                        // Pause rotation by freezing at current angle when not playing
-                        val frozenAngle  = remember { mutableFloatStateOf(0f) }
-                        val displayAngle = if (playbackState.isPlaying) {
-                            frozenAngle.floatValue = diskRotation
-                            diskRotation
-                        } else {
-                            frozenAngle.floatValue
+                        LaunchedEffect(playbackState.isPlaying, liveAngle) {
+                            if (playbackState.isPlaying) frozenAngle = liveAngle
                         }
+                        val displayAngle = if (playbackState.isPlaying) liveAngle else frozenAngle
 
                         Box(
                             modifier = Modifier
@@ -248,8 +283,11 @@ fun NowPlayingScreen(
                             song     = song,
                             size     = 272.dp,
                             shape    = artShape,
-                            modifier = Modifier.border(1.dp, Color.White.copy(alpha = 0.1f), artShape)
+                            modifier = Modifier.border(
+                                1.dp, Color.White.copy(alpha = 0.1f), artShape
+                            )
                         )
+
                         if (isPreparing) {
                             CircularProgressIndicator(
                                 color       = Amber,
@@ -259,8 +297,9 @@ fun NowPlayingScreen(
                         }
                     }
 
-                    Spacer(Modifier.weight(0.35f))
+                    Spacer(Modifier.weight(0.3f))
                 } else {
+                    // ── Lyric player ──────────────────────────────────────────
                     LazyColumn(
                         state               = lyricsState,
                         modifier            = Modifier
@@ -270,7 +309,10 @@ fun NowPlayingScreen(
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         itemsIndexed(song.lyricDocument!!.lines) { idx, line ->
-                            LyricLineItem(text = line.text, isActive = idx == currentLyricLine)
+                            LyricLineItem(
+                                text     = line.text,
+                                isActive = idx == currentLyricLine
+                            )
                         }
                     }
                 }
@@ -305,6 +347,7 @@ fun NowPlayingScreen(
 
                 Spacer(Modifier.height(20.dp))
 
+                // ── Seek slider ───────────────────────────────────────────────
                 PlaybackSlider(
                     positionMs = playbackState.positionMs,
                     durationMs = playbackState.durationMs,
@@ -315,6 +358,7 @@ fun NowPlayingScreen(
 
                 Spacer(Modifier.height(6.dp))
 
+                // ── Transport controls ────────────────────────────────────────
                 PlaybackControls(
                     isPlaying       = playbackState.isPlaying,
                     isPreparing     = isPreparing,
@@ -332,6 +376,7 @@ fun NowPlayingScreen(
 
                 Spacer(Modifier.height(8.dp))
 
+                // ── Speed / Sleep chips + Queue button ────────────────────────
                 Row(
                     modifier              = Modifier
                         .fillMaxWidth()
@@ -349,8 +394,11 @@ fun NowPlayingScreen(
                                 )
                             },
                             leadingIcon = {
-                                Icon(Icons.Filled.Speed, null,
-                                    modifier = Modifier.size(14.dp), tint = Amber)
+                                Icon(
+                                    Icons.Filled.Speed, null,
+                                    modifier = Modifier.size(14.dp),
+                                    tint     = Amber
+                                )
                             },
                             colors = AssistChipDefaults.assistChipColors(
                                 containerColor = AmberDim, labelColor = Amber
@@ -367,12 +415,17 @@ fun NowPlayingScreen(
                         AssistChip(
                             onClick = { showOptionsMenu = true },
                             label   = {
-                                Text("Sleep %d:%02d".format(mins, secs),
-                                    style = MaterialTheme.typography.bodySmall)
+                                Text(
+                                    "Sleep %d:%02d".format(mins, secs),
+                                    style = MaterialTheme.typography.bodySmall
+                                )
                             },
                             leadingIcon = {
-                                Icon(Icons.Filled.Bedtime, null,
-                                    modifier = Modifier.size(14.dp), tint = Amber)
+                                Icon(
+                                    Icons.Filled.Bedtime, null,
+                                    modifier = Modifier.size(14.dp),
+                                    tint     = Amber
+                                )
                             },
                             colors = AssistChipDefaults.assistChipColors(
                                 containerColor = AmberDim, labelColor = Amber
@@ -389,7 +442,63 @@ fun NowPlayingScreen(
                     }
                 }
 
-                Spacer(Modifier.height(24.dp))
+                // ── Next Up peek ──────────────────────────────────────────────
+                // Shows the upcoming song so the user knows what's coming next.
+                // Mirrors the DreamMusic pattern but styled to match Dreamer.
+                AnimatedVisibility(
+                    visible = nextSong != null && !showLyrics,
+                    enter   = fadeIn() + expandVertically(),
+                    exit    = fadeOut() + shrinkVertically()
+                ) {
+                    nextSong?.let { next ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 20.dp)
+                                .padding(bottom = 8.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(Color.White.copy(alpha = 0.07f))
+                                .padding(horizontal = 14.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            Text(
+                                "NEXT",
+                                style    = MaterialTheme.typography.labelSmall,
+                                color    = fgComposeColor.copy(alpha = 0.45f),
+                                modifier = Modifier.width(36.dp)
+                            )
+                            AlbumArtwork(
+                                song  = next,
+                                size  = 36.dp,
+                                shape = RoundedCornerShape(6.dp)
+                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    next.title,
+                                    style    = MaterialTheme.typography.bodyMedium,
+                                    color    = fgComposeColor.copy(alpha = 0.85f),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    next.artist,
+                                    style    = MaterialTheme.typography.bodySmall,
+                                    color    = fgComposeColor.copy(alpha = 0.45f),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            Text(
+                                formatDuration(next.duration),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = fgComposeColor.copy(alpha = 0.4f)
+                            )
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(16.dp))
             }
         }
     }
@@ -414,7 +523,13 @@ private fun OptionsDropdown(
         containerColor   = Surface2
     ) {
         DropdownMenuItem(
-            text    = { Text("Playback Speed", style = MaterialTheme.typography.labelSmall, color = Amber) },
+            text    = {
+                Text(
+                    "Playback Speed",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Amber
+                )
+            },
             onClick = {},
             enabled = false
         )
@@ -426,7 +541,11 @@ private fun OptionsDropdown(
                         verticalAlignment     = Alignment.CenterVertically
                     ) {
                         if (currentSpeed == speed)
-                            Icon(Icons.Filled.Check, null, tint = Amber, modifier = Modifier.size(16.dp))
+                            Icon(
+                                Icons.Filled.Check, null,
+                                tint     = Amber,
+                                modifier = Modifier.size(16.dp)
+                            )
                         else
                             Spacer(Modifier.size(16.dp))
                         Text(
@@ -443,7 +562,13 @@ private fun OptionsDropdown(
         HorizontalDivider(color = Surface3, modifier = Modifier.padding(vertical = 4.dp))
 
         DropdownMenuItem(
-            text    = { Text("Sleep Timer", style = MaterialTheme.typography.labelSmall, color = Amber) },
+            text    = {
+                Text(
+                    "Sleep Timer",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Amber
+                )
+            },
             onClick = {},
             enabled = false
         )
@@ -456,7 +581,11 @@ private fun OptionsDropdown(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalAlignment     = Alignment.CenterVertically
                     ) {
-                        Icon(Icons.Filled.Bedtime, null, tint = Amber, modifier = Modifier.size(16.dp))
+                        Icon(
+                            Icons.Filled.Bedtime, null,
+                            tint     = Amber,
+                            modifier = Modifier.size(16.dp)
+                        )
                         Text(
                             "Cancel (%d:%02d)".format(mins, secs),
                             color = ErrorRed,
@@ -469,7 +598,13 @@ private fun OptionsDropdown(
         } else {
             listOf(5, 10, 15, 20, 30, 45, 60).forEach { minutes ->
                 DropdownMenuItem(
-                    text    = { Text("$minutes minutes", color = TextPrimary, style = MaterialTheme.typography.bodyMedium) },
+                    text = {
+                        Text(
+                            "$minutes minutes",
+                            color = TextPrimary,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    },
                     onClick = { onStartSleepTimer(minutes) }
                 )
             }

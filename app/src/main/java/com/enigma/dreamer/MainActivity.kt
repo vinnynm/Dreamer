@@ -126,12 +126,15 @@ fun DevLyricApp(viewModel: MusicViewModel, openNowPlaying: Boolean = false) {
                     ) {
 
                         composable<LibraryRoute> {
-                            val songs         = state.songs
-                            val filteredSongs = state.filteredSongs
-                            val playlists     = state.playlists
-                            val currentSong   = ps.currentSong
-                            val isPlaying     = ps.isPlaying
-                            val progress      = ps.progress
+                            val songs           = state.songs
+                            val filteredSongs   = state.filteredSongs
+                            val playlists       = state.playlists
+                            val currentSong     = ps.currentSong
+                            val isPlaying       = ps.isPlaying
+                            val progress        = ps.progress
+
+                            // NEW: collect scan progress for the progress bar in LibraryScreen
+                            val scanProgress by viewModel.scanProgress.collectAsState()
 
                             val onSongClickRem = remember(viewModel, filteredSongs) {
                                 { song: Song ->
@@ -142,7 +145,7 @@ fun DevLyricApp(viewModel: MusicViewModel, openNowPlaying: Boolean = false) {
                             val onPlaylistClickRem = remember {
                                 { pl: Playlist -> navController.navigate(PlaylistDetailRoute(pl.id)) }
                             }
-                            val onToggleFavoriteRem = remember(viewModel) { viewModel::toggleFavorite }
+                            val onToggleFavoriteRem = remember { viewModel::toggleFavorite }
                             val onEditLyricsRem = remember {
                                 { song: Song -> navController.navigate(LyricEditorRoute(song.id)) }
                             }
@@ -168,6 +171,7 @@ fun DevLyricApp(viewModel: MusicViewModel, openNowPlaying: Boolean = false) {
                                 currentSong         = currentSong,
                                 isPlaying           = isPlaying,
                                 playbackProgress    = progress,
+                                scanProgress        = scanProgress,          // NEW
                                 onSongClick         = onSongClickRem,
                                 onPlaylistClick     = onPlaylistClickRem,
                                 onSearch            = viewModel::search,
@@ -183,7 +187,8 @@ fun DevLyricApp(viewModel: MusicViewModel, openNowPlaying: Boolean = false) {
                                 onPlayFavorites     = onPlayFavoritesRem,
                                 onMiniPlayerClick   = onMiniPlayerClickRem,
                                 onMiniPlayPause     = viewModel::togglePlayPause,
-                                onMiniNext          = viewModel::next
+                                onMiniNext          = viewModel::next,
+                                onRescan            = viewModel::rescan       // NEW
                             )
                         }
 
