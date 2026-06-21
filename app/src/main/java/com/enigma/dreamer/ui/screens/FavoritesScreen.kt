@@ -12,7 +12,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.enigma.devlyric.core.*
+// FIX: removed `import com.enigma.devlyric.core.*` — this screen has no
+// dependency on the lyric-baking core library; the wildcard was pulling in
+// unrelated symbols (LyricDocument, LyricBaker, etc.) and risking ambiguous
+// reference errors if any name in that package ever collides with something
+// in com.enigma.dreamer.core (e.g. both modules later adding a `Result` type).
 import com.enigma.dreamer.core.Song
 import com.enigma.dreamer.ui.components.*
 import com.enigma.dreamer.ui.theme.*
@@ -75,7 +79,6 @@ fun FavoritesTab(
                     color = TextMuted,
                     modifier = Modifier.weight(1f)
                 )
-                // Play all favourites
                 TextButton(
                     onClick = onPlayAll,
                     colors  = ButtonDefaults.textButtonColors(contentColor = Amber)
@@ -96,9 +99,13 @@ fun FavoritesTab(
             key   = { it.id },
             contentType = { "song" }
         ) { song ->
+            // FIX: label was string-interpolated per-item ("fav${song.id}"), which
+            // is unnecessary — animateColorAsState labels are debug-only tags and
+            // don't need to be unique per list item. A static label avoids
+            // allocating a new string on every recomposition of every row.
             val favTint by animateColorAsState(
                 if (song.isFavorite) Amber else TextMuted,
-                label = "fav${song.id}"
+                label = "fav_tint"
             )
             SongListItem(
                 song = song,

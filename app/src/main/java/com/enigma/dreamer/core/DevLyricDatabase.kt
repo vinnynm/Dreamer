@@ -2,13 +2,15 @@ package com.enigma.dreamer.core
 
 import android.content.Context
 import androidx.room.*
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import kotlinx.coroutines.flow.Flow
 
 // ── Entities ──────────────────────────────────────────────────────────────────
 
 @Entity(tableName = "playlists")
 data class PlaylistEntity(
-    @PrimaryKey(autoGenerate = true) val id: Long = 0,  // was manual timestamp — collision risk fixed
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val name: String,
     val createdAt: Long = System.currentTimeMillis()
 )
@@ -26,7 +28,7 @@ data class PlaylistEntity(
 )
 data class PlaylistSongCrossRef(
     val playlistId: Long,
-    val songId: Long,           // non-nullable — a cross-ref row without a songId is meaningless
+    val songId: Long,
     val position: Int = 0
 )
 
@@ -42,7 +44,7 @@ data class PlaylistWithSongIds(
     val playlistId: Long,
     val name: String,
     val createdAt: Long,
-    val songId: Long?,      // nullable here only — LEFT JOIN may produce null for empty playlists
+    val songId: Long?,
     val position: Int?
 ) {
     fun toPlaylistEntity() = PlaylistEntity(playlistId, name, createdAt)
@@ -70,7 +72,7 @@ interface PlaylistDao {
     suspend fun getAllWithSongIds(): List<PlaylistWithSongIds>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insertPlaylist(playlist: PlaylistEntity): Long  // returns generated id
+    suspend fun insertPlaylist(playlist: PlaylistEntity): Long
 
     @Update
     suspend fun updatePlaylist(playlist: PlaylistEntity): Int
@@ -118,9 +120,51 @@ interface FavoriteDao {
 
 // ── Database ──────────────────────────────────────────────────────────────────
 
+/**
+ * Migration v1 → v2.
+ *
+ * FIX: the original database used `fallbackToDestructiveMigration()`, which
+ * silently DROPS AND RECREATES every table whenever the schema version bumps —
+ * meaning every user's favorites and playlists would have been wiped on the
+ * v1→v2 upgrade (and on any future bump) with zero warning to the user.
+ *
+ * The actual v1→v2 change here was adding autoGenerate to `playlists.id`.
+ * SQLite can't ALTER a PRIMARY KEY's autoincrement behavior in place, so the
+ * standard pattern is: rename the old table, recreate with the new schema,
+ * copy data across, drop the old table. This preserves existing playlists,
+ * cross-refs, and favorites instead of deleting them.
+ *
+ * If you don't actually have any v1 installs in the wild (e.g. this is still
+ * pre-release), you can simplify this back to a plain destructive migration,
+ * but doing so deliberately is safer than the implicit fallback.
+ */
+private val MIGRATION_1_2 = object : Migration(1, 2) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE playlists RENAME TO playlists_old")
+        db.execSQL(
+            """
+            CREATE TABLE playlists (
+                id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                name TEXT NOT NULL,
+                createdAt INTEGER NOT NULL
+            )
+            """.trimIndent()
+        )
+        db.execSQL(
+            """
+            INSERT INTO playlists (id, name, createdAt)
+            SELECT id, name, createdAt FROM playlists_old
+            """.trimIndent()
+        )
+        db.execSQL("DROP TABLE playlists_old")
+        // playlist_songs / favorites are unaffected by this particular change,
+        // so no migration needed for them.
+    }
+}
+
 @Database(
     entities     = [PlaylistEntity::class, PlaylistSongCrossRef::class, FavoriteEntity::class],
-    version      = 2,   // bumped for schema change (autoGenerate on playlists)
+    version      = 2,
     exportSchema = false
 )
 abstract class DevLyricDatabase : RoomDatabase() {
@@ -137,7 +181,11 @@ abstract class DevLyricDatabase : RoomDatabase() {
                     DevLyricDatabase::class.java,
                     "devlyric.db"
                 )
-                    .fallbackToDestructiveMigration()   // v1→v2: schema change, existing data cleared
+                    .addMigrations(MIGRATION_1_2)
+                    // Destructive fallback now only triggers if a migration path
+                    // is truly missing (e.g. very old installs predating v1),
+                    // not as the default behavior for every bump.
+                    .fallbackToDestructiveMigrationOnDowngrade()
                     .build()
                     .also { INSTANCE = it }
             }

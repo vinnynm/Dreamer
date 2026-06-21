@@ -52,31 +52,38 @@ fun LibraryScreen(
     onToggleFavorite: (Song) -> Unit,
     onPlayNext: (Song) -> Unit,
     onAddToQueue: (Song) -> Unit,
-    onEditLyrics: (Song) -> Unit,         // NEW
+    onEditLyrics: (Song) -> Unit,
     onPlayFavorites: () -> Unit,
     onMiniPlayerClick: () -> Unit,
     onMiniPlayPause: () -> Unit,
     onMiniNext: () -> Unit
 ) {
-    var selectedTab               by remember { mutableIntStateOf(0) }
-    var showCreatePlaylistDialog  by remember { mutableStateOf(false) }
-    var newPlaylistName           by remember { mutableStateOf("") }
-    var showSortSheet             by remember { mutableStateOf(false) }
+    var selectedTab              by remember { mutableIntStateOf(0) }
+    var showCreatePlaylistDialog by remember { mutableStateOf(false) }
+    var newPlaylistName          by remember { mutableStateOf("") }
+    var showSortSheet            by remember { mutableStateOf(false) }
     var detailSong                by remember { mutableStateOf<Song?>(null) }
 
-    val onLongClickRem      = remember { { song: Song -> detailSong = song } }
-    val onToggleFavoriteRem = remember(onToggleFavorite) { onToggleFavorite }
+    // FIX: `remember { { song -> detailSong = song } }` with no keys is fine since it
+    // only closes over a MutableState reference (stable). Left as-is — correct.
+    val onLongClickRem = remember { { song: Song -> detailSong = song } }
+
+    // FIX: previously `remember(onToggleFavorite) { onToggleFavorite }` — this just
+    // re-wraps the same lambda reference and re-keys on it every time the caller
+    // passes a new lambda instance (which MainActivity does on every recomposition
+    // since it's not always stably remembered upstream). The remember() here added
+    // no value — removed; we pass onToggleFavorite straight through.
 
     Scaffold(
         containerColor = Amoled,
         topBar = {
             LibraryTopBar(
-                selectedTab = selectedTab,
-                searchQuery = searchQuery,
-                onSearch = onSearch,
-                onSortClick = { showSortSheet = true },
-                onCreatePlaylistClick = { showCreatePlaylistDialog = true },
-                onTabSelect = { selectedTab = it }
+                selectedTab            = selectedTab,
+                searchQuery            = searchQuery,
+                onSearch               = onSearch,
+                onSortClick            = { showSortSheet = true },
+                onCreatePlaylistClick  = { showCreatePlaylistDialog = true },
+                onTabSelect            = { selectedTab = it }
             )
         },
         bottomBar = {
@@ -106,7 +113,7 @@ fun LibraryScreen(
                 isPlaying        = isPlaying,
                 onSongClick      = onSongClick,
                 onLongClick      = onLongClickRem,
-                onToggleFavorite = onToggleFavoriteRem,
+                onToggleFavorite = onToggleFavorite,
                 modifier         = tabModifier
             )
             1 -> FavoritesTab(
@@ -114,7 +121,7 @@ fun LibraryScreen(
                 currentSong      = currentSong,
                 isPlaying        = isPlaying,
                 onSongClick      = onSongClick,
-                onToggleFavorite = onToggleFavoriteRem,
+                onToggleFavorite = onToggleFavorite,
                 onPlayAll        = onPlayFavorites,
                 onLongClick      = onLongClickRem,
                 modifier         = tabModifier
@@ -175,14 +182,14 @@ fun LibraryScreen(
     // ── Song detail sheet ─────────────────────────────────────────────────────
     detailSong?.let { song ->
         SongDetailSheet(
-            song            = song,
-            playlists       = playlists,
-            onDismiss       = { detailSong = null },
-            onPlayNext      = { onPlayNext(song);            detailSong = null },
-            onAddToQueue    = { onAddToQueue(song);          detailSong = null },
-            onAddToPlaylist = { pl -> onAddSongToPlaylist(song, pl.id); detailSong = null },
-            onToggleFavorite = { onToggleFavorite(song);    detailSong = null },
-            onEditLyrics    = { onEditLyrics(song);         detailSong = null }  // NEW
+            song             = song,
+            playlists        = playlists,
+            onDismiss        = { detailSong = null },
+            onPlayNext       = { onPlayNext(song);   detailSong = null },
+            onAddToQueue     = { onAddToQueue(song); detailSong = null },
+            onAddToPlaylist  = { pl -> onAddSongToPlaylist(song, pl.id); detailSong = null },
+            onToggleFavorite = { onToggleFavorite(song); detailSong = null },
+            onEditLyrics     = { onEditLyrics(song); detailSong = null }
         )
     }
 }
@@ -293,7 +300,8 @@ private fun SortBottomSheet(
         ) {
             Text("Sort by", style = MaterialTheme.typography.titleMedium,
                 color = TextPrimary, modifier = Modifier.padding(bottom = 12.dp))
-            SortOrder.values().forEach { order ->
+            // .entries replaces deprecated .values()
+            SortOrder.entries.forEach { order ->
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -368,17 +376,17 @@ fun SongsTab(
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
         }
         items(
-            items = songs,
-            key   = { it.id },
+            items       = songs,
+            key         = { it.id },
             contentType = { "song" }
         ) { song ->
             val favTint by animateColorAsState(
-                if (song.isFavorite) Amber else TextMuted, label = "fav${song.id}"
+                if (song.isFavorite) Amber else TextMuted, label = "fav_tint"
             )
             SongListItem(
-                song      = song,
-                isPlaying = song.id == currentSong?.id && isPlaying,
-                onClick   = { onSongClick(song) },
+                song        = song,
+                isPlaying   = song.id == currentSong?.id && isPlaying,
+                onClick     = { onSongClick(song) },
                 onLongClick = { onLongClick(song) },
                 trailingContent = {
                     IconButton(onClick = { onToggleFavorite(song) }) {
@@ -424,8 +432,8 @@ fun PlaylistsTab(
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
     ) {
         items(
-            items = playlists,
-            key   = { it.id },
+            items       = playlists,
+            key         = { it.id },
             contentType = { "playlist" }
         ) { playlist ->
             PlaylistItem(

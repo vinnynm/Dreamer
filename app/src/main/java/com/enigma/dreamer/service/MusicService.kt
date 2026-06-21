@@ -19,26 +19,17 @@ import kotlinx.coroutines.flow.*
 /**
  * Foreground media playback service — Media3 / ExoPlayer.
  *
- * ── Notification fix summary ─────────────────────────────────────────────────
- *
- * Root cause of blank white notification: three things were all missing at once.
- *
- * 1. No notification channel  →  nothing to post into on API 26+.
- * 2. No MediaNotification.Provider attached via setMediaNotificationProvider()
- *    →  Media3's internal fallback produces a minimal notification with no color.
- * 3. Album art stored in a local field but never injected into the Player's
- *    MediaMetadata  →  notification provider has no bitmap to show.
- *
- * Fix:
- *  - [DreamerNotificationProvider] extends [DefaultMediaNotificationProvider],
- *    which handles all MediaStyle / compat wiring correctly for modern Android.
+ * Notification color fix summary
+ * ─────────────────────────────────────────────────────────────────────────────
+ * 1. [DreamerNotificationProvider] extends [DefaultMediaNotificationProvider].
  *    We override only [addNotificationActions] to apply color + large icon.
- *  - [updateAlbumArt] calls [Player.replaceMediaItem] with the new
- *    [MediaMetadata.artworkData] (an in-memory JPEG byte array).
- *    DefaultMediaNotificationProvider reads artworkData in preference to
- *    artworkUri, so the art appears without any network fetch.
- *  - [DreamerNotificationProvider.setAccentColor] stores the dominant color;
- *    it is applied via setColor() + setColorized(true) in the builder callback.
+ * 2. [updateAlbumArt] injects album art into [MediaMetadata.artworkData] via
+ *    [Player.replaceMediaItem]. [DefaultMediaNotificationProvider] reads
+ *    artworkData first so art appears without a network fetch.
+ * 3. The dominant color is computed by the ViewModel (single source of truth)
+ *    and passed in via [updateAlbumArt]. MusicService no longer runs its own
+ *    color-sampling algorithm — removes the earlier inconsistency where
+ *    MusicService used 0.85 multiplier and ViewModel used 0.70.
  */
 @OptIn(UnstableApi::class)
 class MusicService : MediaLibraryService() {
@@ -53,7 +44,6 @@ class MusicService : MediaLibraryService() {
 
     override fun onBind(intent: Intent?): IBinder? {
         val superBinder = super.onBind(intent)
-        // Direct VM connections have no action; Media3/system connections carry one.
         return if (intent?.action == null) binder else superBinder
     }
 
@@ -68,11 +58,11 @@ class MusicService : MediaLibraryService() {
 
     // ── Core objects ──────────────────────────────────────────────────────────
 
-    private lateinit var player: ExoPlayer
-    private lateinit var mediaSession: MediaLibrarySession
+    private lateinit var player:               ExoPlayer
+    private lateinit var mediaSession:         MediaLibrarySession
     private lateinit var notificationProvider: DreamerNotificationProvider
 
-    // ── Album art / color ─────────────────────────────────────────────────────
+    // ── Album art ─────────────────────────────────────────────────────────────
 
     private var albumArtBitmap: Bitmap? = null
 
@@ -114,7 +104,6 @@ class MusicService : MediaLibraryService() {
         buildPlayer()
         buildMediaSession()
         observePlayerState()
-        // Must be set AFTER buildMediaSession() so the session reference exists
         notificationProvider = DreamerNotificationProvider(this, NOTIF_CHANNEL_ID)
         setMediaNotificationProvider(notificationProvider)
     }
@@ -144,7 +133,7 @@ class MusicService : MediaLibraryService() {
             val channel = NotificationChannel(
                 NOTIF_CHANNEL_ID,
                 "Music Playback",
-                NotificationManager.IMPORTANCE_LOW       // silent: no heads-up, no sound
+                NotificationManager.IMPORTANCE_LOW
             ).apply {
                 description          = "Shows the currently playing song with transport controls"
                 lockscreenVisibility = Notification.VISIBILITY_PUBLIC
@@ -164,12 +153,10 @@ class MusicService : MediaLibraryService() {
                     .setUsage(C.USAGE_MEDIA)
                     .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
                     .build(),
-                true   // handleAudioFocus
+                true
             )
             .setHandleAudioBecomingNoisy(true)
             .build()
-        // We own the queue order; ExoPlayer's shuffle must stay OFF so that
-        // currentMediaItemIndex always matches our queue list 1-to-1.
         player.shuffleModeEnabled = false
     }
 
@@ -260,6 +247,7 @@ class MusicService : MediaLibraryService() {
                 )
                 albumArtBitmap?.recycle()
                 albumArtBitmap = null
+                // Reset to neutral dark color until new art loads
                 notificationProvider.setAccentColor(Color.parseColor("#1A1A1A"))
                 persistState()
             }
@@ -302,8 +290,6 @@ class MusicService : MediaLibraryService() {
     fun setQueue(queue: List<Song>, index: Int) {
         val ps = _playbackState.value
 
-        // Optimization: If the queue is identical, just seek and play.
-        // This avoids rebuilding thousands of MediaItems when clicking in the same list.
         if (queue === originalQueue || (queue.size == originalQueue.size && queue == originalQueue)) {
             val song = queue.getOrNull(index)
             val effectiveIdx = if (ps.shuffleMode == ShuffleMode.ON) {
@@ -352,9 +338,9 @@ class MusicService : MediaLibraryService() {
         persistState()
     }
 
-    fun play()     { player.play() }
-    fun pause()    { player.pause() }
-    fun next()     { if (player.hasNextMediaItem()) player.seekToNextMediaItem() }
+    fun play()  { player.play() }
+    fun pause() { player.pause() }
+    fun next()  { if (player.hasNextMediaItem()) player.seekToNextMediaItem() }
 
     fun previous() {
         if (player.currentPosition > 3_000L) player.seekTo(0L)
@@ -395,8 +381,6 @@ class MusicService : MediaLibraryService() {
             newIdx   = newQueue.indexOfFirst { it.id == ps.currentSong?.id }.coerceAtLeast(0)
         }
 
-        // To prevent playback from restarting from the beginning of the list,
-        // we update the player's queue and then seek to the current song's new index.
         player.setMediaItems(newQueue.map { it.toMediaItem() }, newIdx, savedPos)
         _playbackState.value = ps.copy(queue = newQueue, queueIndex = newIdx, shuffleMode = mode)
         persistState()
@@ -429,30 +413,29 @@ class MusicService : MediaLibraryService() {
     }
 
     /**
-     * Called from [MusicViewModel] after the album art bitmap is decoded.
+     * Called by [MusicViewModel] after decoding album art and computing the
+     * dominant color. The ViewModel is now the single source of truth for color
+     * derivation — we receive the pre-computed [accentColor] rather than
+     * resampling the bitmap here.
      *
-     * The three steps below are ALL required for a colored notification with art:
-     *
-     * 1. Scale the bitmap to notification resolution (256 px square max).
-     * 2. Derive the dominant accent color and pass it to the notification provider.
-     * 3. Encode the bitmap as JPEG bytes and inject them into the current
-     *    [MediaItem]'s [MediaMetadata.artworkData] via [Player.replaceMediaItem].
-     *    [DefaultMediaNotificationProvider] reads `artworkData` first (in-memory,
-     *    no URI fetch needed), which is what actually makes art appear.
+     * Steps:
+     * 1. Scale bitmap to ≤256 px for the notification large icon.
+     * 2. Apply [accentColor] to [DreamerNotificationProvider].
+     * 3. Encode as JPEG bytes and inject into the current [MediaItem]'s
+     *    [MediaMetadata.artworkData] so the notification provider can display it.
      */
-    fun updateAlbumArt(bitmap: Bitmap) {
+    fun updateAlbumArt(bitmap: Bitmap, accentColor: Int) {
         val scaled = scaleBitmap(bitmap, 256)
         albumArtBitmap?.recycle()
         albumArtBitmap = scaled
 
-        val accentColor = dominantColor(scaled)
+        // Use the color already computed by the ViewModel — no redundant sampling
         notificationProvider.setAccentColor(accentColor)
 
         val artBytes = bitmapToJpegBytes(scaled)
         val idx      = player.currentMediaItemIndex
         val current  = player.currentMediaItem ?: return
 
-        // replaceMediaItem updates metadata only — playback is NOT interrupted
         player.replaceMediaItem(
             idx,
             current.buildUpon()
@@ -581,7 +564,7 @@ class MusicService : MediaLibraryService() {
                     .setArtist(artist)
                     .setAlbumTitle(album)
                     .setDurationMs(duration)
-                    .setArtworkUri(albumArtUri)   // URI fallback for the system loader
+                    .setArtworkUri(albumArtUri)
                     .build()
             )
             .build()
@@ -606,23 +589,5 @@ class MusicService : MediaLibraryService() {
         val out = java.io.ByteArrayOutputStream()
         bmp.compress(Bitmap.CompressFormat.JPEG, 85, out)
         return out.toByteArray()
-    }
-
-    private fun dominantColor(bmp: Bitmap): Int {
-        val stepX = bmp.width  / 12f
-        val stepY = bmp.height / 12f
-        val hsv   = FloatArray(3)
-        val samples = (0..11).flatMap { row ->
-            (0..11).map { col ->
-                bmp.getPixel((col * stepX).toInt(), (row * stepY).toInt())
-            }
-        }
-        val vibrant = samples.sortedByDescending {
-            Color.colorToHSV(it, hsv); hsv[1] * hsv[2]
-        }.take(20)
-        val r = (vibrant.map { Color.red(it)   }.average() * 0.85).toInt().coerceIn(0, 255)
-        val g = (vibrant.map { Color.green(it) }.average() * 0.85).toInt().coerceIn(0, 255)
-        val b = (vibrant.map { Color.blue(it)  }.average() * 0.85).toInt().coerceIn(0, 255)
-        return Color.rgb(r, g, b)
     }
 }

@@ -51,21 +51,31 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     // ── Service binding ───────────────────────────────────────────────────────
 
     private var musicService: MusicService? = null
-    private var positionJob: Job? = null
-    private var playlistObserverJob: Job? = null
-    private var favoriteObserverJob: Job? = null
+    private var positionJob:        Job? = null
+    private var playlistObserverJob:Job? = null
+    private var favoriteObserverJob:Job? = null
+
+    /**
+     * Track the last URI we extracted color from so we don't re-decode the same
+     * bitmap on every 500 ms position tick. Only re-extract when the song changes.
+     */
+    private var lastColorUri: Uri? = null
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             val b = binder as MusicService.MusicBinder
             musicService = b.service
+
             viewModelScope.launch {
-                b.service.playbackState.collect { ps -> updatePlayback(ps) }
+                b.service.playbackState
+                    // Only propagate distinct song changes for color extraction,
+                    // but let all state changes reach the UI.
+                    .collect { ps -> updatePlayback(ps) }
             }
             startPositionTracking()
-            // tryRestoreSession is guarded internally — safe to call from both paths
             readyState?.songs?.let { b.service.tryRestoreSession(it) }
         }
+
         override fun onServiceDisconnected(name: ComponentName) {
             musicService = null
             positionJob?.cancel()
@@ -95,7 +105,6 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 )
                 observePlaylists()
                 observeFavorites()
-                // tryRestoreSession is guarded — safe to call here too
                 musicService?.tryRestoreSession(songs)
             } catch (e: Exception) {
                 _uiState.value = MusicUiState.Error(e.message ?: "Failed to load songs")
@@ -195,10 +204,6 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         mutateReady { copy(showQueue = !showQueue) }
     }
 
-    /**
-     * FIX: was calling service.setQueue() which restarted the current track.
-     * Now uses insertIntoQueue() which calls ExoPlayer's addMediaItem() directly.
-     */
     fun playNext(song: Song) {
         val service = musicService ?: return
         val ps      = service.playbackState.value
@@ -210,10 +215,6 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * FIX: was calling service.setQueue() which restarted the current track.
-     * Now uses appendToQueue() which calls ExoPlayer's addMediaItem() directly.
-     */
     fun addToQueue(song: Song) {
         val service = musicService ?: return
         val ps      = service.playbackState.value
@@ -299,11 +300,6 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         mutateReady { copy(showLyrics = !showLyrics) }
     }
 
-    /**
-     * Bakes [lyricText] into the audio file on disk and updates the in-memory
-     * Song so the change is reflected immediately in the UI without reload.
-     * Returns true on success.
-     */
     fun bakeLyricsToSong(
         song: Song,
         lyricText: String,
@@ -320,15 +316,12 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                         copy(
                             songs         = newSongs,
                             filteredSongs = searchSongsUseCase(newSongs, searchQuery),
-                            // update currently playing song if it's the same one
                             playbackState = if (playbackState.currentSong?.id == song.id)
-                                playbackState.copy(currentSong = updated)
-                            else playbackState
+                                playbackState.copy(currentSong = updated) else playbackState
                         )
                     }
                     onResult(true, "Lyrics baked into ${song.title}")
                 } else {
-                    // Unsupported format — save sidecar .lrc instead
                     val sidecarOk = repo.saveSidecarLrc(song.filePath, lyricText)
                     if (sidecarOk) {
                         val parsed  = LyricParser.parse(lyricText, format)
@@ -339,8 +332,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                                 songs         = newSongs,
                                 filteredSongs = searchSongsUseCase(newSongs, searchQuery),
                                 playbackState = if (playbackState.currentSong?.id == song.id)
-                                    playbackState.copy(currentSong = updated)
-                                else playbackState
+                                    playbackState.copy(currentSong = updated) else playbackState
                             )
                         }
                         onResult(true, "Saved as sidecar .lrc file")
@@ -360,7 +352,18 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     // ── Dynamic album-art colour ──────────────────────────────────────────────
 
+    /**
+     * Extracts dominant + contrast colors from [artUri] and pushes them into
+     * [MusicUiState.Ready.dominantColor] / [accentTextColor].
+     *
+     * Guards against duplicate decodes: if [artUri] is the same as the last
+     * call we skip the IO entirely. This is important because [updatePlayback]
+     * is called on every ExoPlayer state tick, not just song changes.
+     */
     fun extractAndApplyColor(artUri: Uri?) {
+        if (artUri == lastColorUri) return      // ← prevents 500 ms decode storm
+        lastColorUri = artUri
+
         viewModelScope.launch(Dispatchers.IO) {
             val bitmap = artUri?.let { uri ->
                 runCatching {
@@ -372,24 +375,37 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             val contrast = contrastColor(dominant)
             withContext(Dispatchers.Main) {
                 mutateReady { copy(dominantColor = dominant, accentTextColor = contrast) }
-                bitmap?.let { musicService?.updateAlbumArt(it) }
+                // Pass the pre-computed accent color so MusicService doesn't
+                // need to run its own (formerly inconsistent) sampling algorithm.
+                bitmap?.let { musicService?.updateAlbumArt(it, dominant) }
             }
         }
     }
 
+    /**
+     * Single, shared dominant-color algorithm.
+     * Samples a 12×12 grid, picks the 20 most vibrant pixels, and averages them
+     * at 70% brightness so the result works as a dark background.
+     *
+     * Previously duplicated (with different multipliers: 0.85 in MusicService,
+     * 0.70 here) — consolidated here, MusicService now calls [updateAlbumArt]
+     * after we've already derived the color so it only needs the bitmap.
+     */
     private fun dominantColor(bmp: android.graphics.Bitmap): Int {
         val stepX   = bmp.width  / 12f
         val stepY   = bmp.height / 12f
         val hsv     = FloatArray(3)
-        val samples = (0..11).flatMap { row ->
-            (0..11).map { col -> bmp.getPixel((col * stepX).toInt(), (row * stepY).toInt()) }
+        // Pre-size the list to avoid repeated resizing
+        val samples = ArrayList<Int>(144).apply {
+            for (row in 0..11) for (col in 0..11)
+                add(bmp.getPixel((col * stepX).toInt(), (row * stepY).toInt()))
         }
         val vibrant = samples.sortedByDescending {
             Color.colorToHSV(it, hsv); hsv[1] * hsv[2]
         }.take(20)
-        val r = (vibrant.map { Color.red(it)   }.average() * 0.7).toInt()
-        val g = (vibrant.map { Color.green(it) }.average() * 0.7).toInt()
-        val b = (vibrant.map { Color.blue(it)  }.average() * 0.7).toInt()
+        val r = (vibrant.sumOf { Color.red(it)   } / 20.0 * 0.70).toInt().coerceIn(0, 255)
+        val g = (vibrant.sumOf { Color.green(it) } / 20.0 * 0.70).toInt().coerceIn(0, 255)
+        val b = (vibrant.sumOf { Color.blue(it)  } / 20.0 * 0.70).toInt().coerceIn(0, 255)
         return Color.rgb(r, g, b)
     }
 
@@ -435,9 +451,18 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    /**
+     * Called from the service collector on every [PlaybackState] update.
+     * We only trigger color extraction when the song actually changes —
+     * not on every isPlaying/position change.
+     */
     private fun updatePlayback(ps: PlaybackState) {
+        val previousSongId = readyState?.playbackState?.currentSong?.id
         mutateReady { copy(playbackState = ps) }
-        ps.currentSong?.albumArtUri?.let { extractAndApplyColor(it) }
+        // Only re-extract art color when the track actually changed
+        if (ps.currentSong?.id != previousSongId) {
+            ps.currentSong?.albumArtUri?.let { extractAndApplyColor(it) }
+        }
     }
 
     private fun mutateReady(block: MusicUiState.Ready.() -> MusicUiState.Ready) {

@@ -17,6 +17,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
 import androidx.navigation.compose.NavHost
@@ -34,7 +35,6 @@ import com.enigma.dreamer.ui.screens.NowPlayingScreen
 import com.enigma.dreamer.ui.screens.PlaylistDetailScreen
 import com.enigma.dreamer.ui.screens.SettingsScreen
 import com.enigma.dreamer.ui.theme.*
-import com.enigma.dreamer.ui.theme.DreamerTheme
 import com.enigma.dreamer.viewmodel.MusicViewModel
 
 class MainActivity : ComponentActivity() {
@@ -50,12 +50,10 @@ class MainActivity : ComponentActivity() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
         requestPermissions()
         setContent {
-            DreamerTheme {
-                DevLyricApp(
-                    viewModel      = viewModel,
-                    openNowPlaying = intent?.getBooleanExtra("open_now_playing", false) == true
-                )
-            }
+            DevLyricApp(
+                viewModel      = viewModel,
+                openNowPlaying = intent?.getBooleanExtra("open_now_playing", false) == true
+            )
         }
     }
 
@@ -96,201 +94,212 @@ fun DevLyricApp(viewModel: MusicViewModel, openNowPlaying: Boolean = false) {
         if (openNowPlaying) navController.navigate(NowPlayingRoute) { launchSingleTop = true }
     }
 
-    when (val state = uiState) {
-        is MusicUiState.Loading -> LoadingScreen()
-        is MusicUiState.Error   -> ErrorScreen(state.message) { }
-        is MusicUiState.Ready   -> {
-            val ps                = state.playbackState
-            val snackbarHostState = remember { SnackbarHostState() }
+    // ── Derive dynamic theme colors from album art ────────────────────────────
+    // Extract colors at this level so DreamerTheme can receive them and propagate
+    // via LocalDynamicColors to the entire composition tree.
+    val (dominantColor, accentTextColor) = when (val state = uiState) {
+        is MusicUiState.Ready -> Color(state.dominantColor) to Color(state.accentTextColor)
+        else                  -> Surface1 to TextPrimary
+    }
 
-            LaunchedEffect(ps.error) {
-                ps.error?.let { viewModel.clearError(); snackbarHostState.showSnackbar(it) }
-            }
+    DreamerTheme(
+        dominantColor   = dominantColor,
+        accentTextColor = accentTextColor
+    ) {
+        when (val state = uiState) {
+            is MusicUiState.Loading -> LoadingScreen()
+            is MusicUiState.Error   -> ErrorScreen(state.message) { }
+            is MusicUiState.Ready   -> {
+                val ps                = state.playbackState
+                val snackbarHostState = remember { SnackbarHostState() }
 
-            Box(Modifier.fillMaxSize()) {
-                NavHost(
-                    navController    = navController,
-                    startDestination = if (openNowPlaying) NowPlayingRoute else LibraryRoute,
-                    enterTransition  = { fadeIn() + slideInVertically { it / 4 } },
-                    exitTransition   = { fadeOut() + slideOutVertically { -it / 4 } }
-                ) {
+                LaunchedEffect(ps.error) {
+                    ps.error?.let { viewModel.clearError(); snackbarHostState.showSnackbar(it) }
+                }
 
-                    composable<LibraryRoute> {
-                        val songs           = state.songs
-                        val filteredSongs   = state.filteredSongs
-                        val playlists       = state.playlists
-                        val currentSong     = ps.currentSong
-                        val isPlaying       = ps.isPlaying
-                        val progress        = ps.progress
+                Box(Modifier.fillMaxSize()) {
+                    NavHost(
+                        navController    = navController,
+                        startDestination = if (openNowPlaying) NowPlayingRoute else LibraryRoute,
+                        enterTransition  = { fadeIn() + slideInVertically { it / 4 } },
+                        exitTransition   = { fadeOut() + slideOutVertically { -it / 4 } }
+                    ) {
 
-                        val onSongClickRem = remember(viewModel, filteredSongs) {
-                            { song: Song ->
-                                viewModel.playSong(song, filteredSongs)
-                                navController.navigate(NowPlayingRoute)
-                            }
-                        }
-                        val onPlaylistClickRem = remember {
-                            { pl: Playlist -> navController.navigate(PlaylistDetailRoute(pl.id)) }
-                        }
-                        val onToggleFavoriteRem = remember { viewModel::toggleFavorite }
-                        val onEditLyricsRem = remember {
-                            { song: Song -> navController.navigate(LyricEditorRoute(song.id)) }
-                        }
-                        val onMiniPlayerClickRem = remember {
-                            { navController.navigate(NowPlayingRoute) }
-                        }
-                        val onPlayFavoritesRem = remember(viewModel, songs) {
-                            {
-                                val favs = songs.filter { it.isFavorite }
-                                if (favs.isNotEmpty()) {
-                                    viewModel.playSong(favs.first(), favs)
+                        composable<LibraryRoute> {
+                            val songs         = state.songs
+                            val filteredSongs = state.filteredSongs
+                            val playlists     = state.playlists
+                            val currentSong   = ps.currentSong
+                            val isPlaying     = ps.isPlaying
+                            val progress      = ps.progress
+
+                            val onSongClickRem = remember(viewModel, filteredSongs) {
+                                { song: Song ->
+                                    viewModel.playSong(song, filteredSongs)
                                     navController.navigate(NowPlayingRoute)
                                 }
                             }
+                            val onPlaylistClickRem = remember {
+                                { pl: Playlist -> navController.navigate(PlaylistDetailRoute(pl.id)) }
+                            }
+                            val onToggleFavoriteRem = remember(viewModel) { viewModel::toggleFavorite }
+                            val onEditLyricsRem = remember {
+                                { song: Song -> navController.navigate(LyricEditorRoute(song.id)) }
+                            }
+                            val onMiniPlayerClickRem = remember {
+                                { navController.navigate(NowPlayingRoute) }
+                            }
+                            val onPlayFavoritesRem = remember(viewModel, songs) {
+                                {
+                                    val favs = songs.filter { it.isFavorite }
+                                    if (favs.isNotEmpty()) {
+                                        viewModel.playSong(favs.first(), favs)
+                                        navController.navigate(NowPlayingRoute)
+                                    }
+                                }
+                            }
+
+                            LibraryScreen(
+                                songs               = songs,
+                                filteredSongs       = filteredSongs,
+                                playlists           = playlists,
+                                searchQuery         = state.searchQuery,
+                                sortOrder           = state.sortOrder,
+                                currentSong         = currentSong,
+                                isPlaying           = isPlaying,
+                                playbackProgress    = progress,
+                                onSongClick         = onSongClickRem,
+                                onPlaylistClick     = onPlaylistClickRem,
+                                onSearch            = viewModel::search,
+                                onSortChange        = viewModel::setSortOrder,
+                                onCreatePlaylist    = viewModel::createPlaylist,
+                                onDeletePlaylist    = viewModel::deletePlaylist,
+                                onRenamePlaylist    = viewModel::renamePlaylist,
+                                onAddSongToPlaylist = viewModel::addSongToPlaylist,
+                                onToggleFavorite    = onToggleFavoriteRem,
+                                onPlayNext          = viewModel::playNext,
+                                onAddToQueue        = viewModel::addToQueue,
+                                onEditLyrics        = onEditLyricsRem,
+                                onPlayFavorites     = onPlayFavoritesRem,
+                                onMiniPlayerClick   = onMiniPlayerClickRem,
+                                onMiniPlayPause     = viewModel::togglePlayPause,
+                                onMiniNext          = viewModel::next
+                            )
                         }
 
-                        LibraryScreen(
-                            songs               = songs,
-                            filteredSongs       = filteredSongs,
-                            playlists           = playlists,
-                            searchQuery         = state.searchQuery,
-                            sortOrder           = state.sortOrder,
-                            currentSong         = currentSong,
-                            isPlaying           = isPlaying,
-                            playbackProgress    = progress,
-                            onSongClick         = onSongClickRem,
-                            onPlaylistClick     = onPlaylistClickRem,
-                            onSearch            = viewModel::search,
-                            onSortChange        = viewModel::setSortOrder,
-                            onCreatePlaylist    = viewModel::createPlaylist,
-                            onDeletePlaylist    = viewModel::deletePlaylist,
-                            onRenamePlaylist    = viewModel::renamePlaylist,
-                            onAddSongToPlaylist = viewModel::addSongToPlaylist,
-                            onToggleFavorite    = onToggleFavoriteRem,
-                            onPlayNext          = viewModel::playNext,
-                            onAddToQueue        = viewModel::addToQueue,
-                            onEditLyrics        = onEditLyricsRem,
-                            onPlayFavorites     = onPlayFavoritesRem,
-                            onMiniPlayerClick   = onMiniPlayerClickRem,
-                            onMiniPlayPause     = viewModel::togglePlayPause,
-                            onMiniNext          = viewModel::next
-                        )
-                    }
+                        composable<NowPlayingRoute> {
+                            NowPlayingScreen(
+                                playbackState      = ps,
+                                currentLyricLine   = state.currentLyricLine,
+                                showLyrics         = state.showLyrics,
+                                showQueue          = state.showQueue,
+                                dominantColor      = state.dominantColor,
+                                accentTextColor    = state.accentTextColor,
+                                onPlayPause        = viewModel::togglePlayPause,
+                                onNext             = viewModel::next,
+                                onPrevious         = viewModel::previous,
+                                onSeek             = viewModel::seekTo,
+                                onToggleRepeat     = viewModel::toggleRepeat,
+                                onToggleShuffle    = viewModel::toggleShuffle,
+                                onToggleLyrics     = viewModel::toggleLyrics,
+                                onToggleFavorite   = { ps.currentSong?.let { viewModel.toggleFavorite(it) } },
+                                onToggleQueue      = viewModel::toggleQueueView,
+                                onSpeedChange      = viewModel::setPlaybackSpeed,
+                                onStartSleepTimer  = viewModel::startSleepTimer,
+                                onCancelSleepTimer = viewModel::cancelSleepTimer,
+                                onOpenSettings     = { navController.navigate(SettingsRoute) },
+                                onSkipToQueue      = viewModel::skipToQueueItem,
+                                onBack             = { navController.popBackStack() }
+                            )
+                        }
 
-                    composable<NowPlayingRoute> {
-                        NowPlayingScreen(
-                            playbackState      = ps,
-                            currentLyricLine   = state.currentLyricLine,
-                            showLyrics         = state.showLyrics,
-                            showQueue          = state.showQueue,
-                            dominantColor      = state.dominantColor,
-                            accentTextColor    = state.accentTextColor,
-                            onPlayPause        = viewModel::togglePlayPause,
-                            onNext             = viewModel::next,
-                            onPrevious         = viewModel::previous,
-                            onSeek             = viewModel::seekTo,
-                            onToggleRepeat     = viewModel::toggleRepeat,
-                            onToggleShuffle    = viewModel::toggleShuffle,
-                            onToggleLyrics     = viewModel::toggleLyrics,
-                            onToggleFavorite   = { ps.currentSong?.let { viewModel.toggleFavorite(it) } },
-                            onToggleQueue      = viewModel::toggleQueueView,
-                            onSpeedChange      = viewModel::setPlaybackSpeed,
-                            onStartSleepTimer  = viewModel::startSleepTimer,
-                            onCancelSleepTimer = viewModel::cancelSleepTimer,
-                            onOpenSettings     = { navController.navigate(SettingsRoute) },
-                            onSkipToQueue      = viewModel::skipToQueueItem,
-                            onBack             = { navController.popBackStack() }
-                        )
-                    }
+                        composable<SettingsRoute> {
+                            SettingsScreen(
+                                playbackSpeed      = ps.playbackSpeed,
+                                sortOrder          = state.sortOrder,
+                                sleepTimer         = ps.sleepTimer,
+                                onSpeedChange      = viewModel::setPlaybackSpeed,
+                                onSortChange       = viewModel::setSortOrder,
+                                onStartSleepTimer  = viewModel::startSleepTimer,
+                                onCancelSleepTimer = viewModel::cancelSleepTimer,
+                                onBack             = { navController.popBackStack() }
+                            )
+                        }
 
-                    composable<SettingsRoute> {
-                        SettingsScreen(
-                            playbackSpeed      = ps.playbackSpeed,
-                            sortOrder          = state.sortOrder,
-                            sleepTimer         = ps.sleepTimer,
-                            onSpeedChange      = viewModel::setPlaybackSpeed,
-                            onSortChange       = viewModel::setSortOrder,
-                            onStartSleepTimer  = viewModel::startSleepTimer,
-                            onCancelSleepTimer = viewModel::cancelSleepTimer,
-                            onBack             = { navController.popBackStack() }
-                        )
-                    }
-
-                    composable<PlaylistDetailRoute> { entry ->
-                        val route    = entry.toRoute<PlaylistDetailRoute>()
-                        val playlist = state.playlists.find { it.id == route.playlistId }
-                        if (playlist != null) {
-                            val songs = playlist.songIds.mapNotNull { id ->
-                                state.songs.find { it.id == id }
+                        composable<PlaylistDetailRoute> { entry ->
+                            val route    = entry.toRoute<PlaylistDetailRoute>()
+                            val playlist = state.playlists.find { it.id == route.playlistId }
+                            if (playlist != null) {
+                                val songs = playlist.songIds.mapNotNull { id ->
+                                    state.songs.find { it.id == id }
+                                }
+                                PlaylistDetailScreen(
+                                    playlist    = playlist,
+                                    songs       = songs,
+                                    currentSong = ps.currentSong,
+                                    isPlaying   = ps.isPlaying,
+                                    onSongClick = { song ->
+                                        viewModel.playSong(song, songs)
+                                        navController.navigate(NowPlayingRoute)
+                                    },
+                                    onRemoveSong = { song ->
+                                        viewModel.removeSongFromPlaylist(song, playlist.id)
+                                    },
+                                    onPlayAll = {
+                                        viewModel.playPlaylist(playlist)
+                                        navController.navigate(NowPlayingRoute)
+                                    },
+                                    onBack = { navController.popBackStack() }
+                                )
+                            } else {
+                                navController.popBackStack()
                             }
-                            PlaylistDetailScreen(
-                                playlist    = playlist,
-                                songs       = songs,
-                                currentSong = ps.currentSong,
-                                isPlaying   = ps.isPlaying,
-                                onSongClick = { song ->
-                                    viewModel.playSong(song, songs)
-                                    navController.navigate(NowPlayingRoute)
-                                },
-                                onRemoveSong = { song ->
-                                    viewModel.removeSongFromPlaylist(song, playlist.id)
-                                },
-                                onPlayAll = {
-                                    viewModel.playPlaylist(playlist)
-                                    navController.navigate(NowPlayingRoute)
+                        }
+
+                        composable<LyricEditorRoute> { entry ->
+                            val route = entry.toRoute<LyricEditorRoute>()
+                            val song  = state.songs.find { it.id == route.songId }
+
+                            if (song == null) {
+                                navController.popBackStack()
+                                return@composable
+                            }
+
+                            var isSaving    by remember { mutableStateOf(false) }
+                            var saveMessage by remember { mutableStateOf<String?>(null) }
+
+                            LaunchedEffect(saveMessage) {
+                                saveMessage?.let { msg ->
+                                    snackbarHostState.showSnackbar(msg)
+                                    saveMessage = null
+                                }
+                            }
+
+                            LyricEditorScreen(
+                                song          = song,
+                                isSaving      = isSaving,
+                                saveMessage   = saveMessage,
+                                onSaveAndBake = { lyricText, format ->
+                                    isSaving = true
+                                    viewModel.bakeLyricsToSong(song, lyricText, format) { success, msg ->
+                                        isSaving    = false
+                                        saveMessage = msg
+                                        if (success) navController.popBackStack()
+                                    }
                                 },
                                 onBack = { navController.popBackStack() }
                             )
-                        } else {
-                            navController.popBackStack()
                         }
                     }
 
-                    // ── Lyric Editor ──────────────────────────────────────────
-                    composable<LyricEditorRoute> { entry ->
-                        val route = entry.toRoute<LyricEditorRoute>()
-                        val song  = state.songs.find { it.id == route.songId }
-
-                        if (song == null) {
-                            navController.popBackStack()
-                            return@composable
-                        }
-
-                        // Local UI state for save progress + result message
-                        var isSaving     by remember { mutableStateOf(false) }
-                        var saveMessage  by remember { mutableStateOf<String?>(null) }
-
-                        LaunchedEffect(saveMessage) {
-                            saveMessage?.let { msg ->
-                                snackbarHostState.showSnackbar(msg)
-                                saveMessage = null
-                            }
-                        }
-
-                        LyricEditorScreen(
-                            song         = song,
-                            isSaving     = isSaving,
-                            saveMessage  = saveMessage,
-                            onSaveAndBake = { lyricText, format ->
-                                isSaving = true
-                                viewModel.bakeLyricsToSong(song, lyricText, format) { success, msg ->
-                                    isSaving    = false
-                                    saveMessage = msg
-                                    if (success) navController.popBackStack()
-                                }
-                            },
-                            onBack = { navController.popBackStack() }
-                        )
-                    }
+                    SnackbarHost(
+                        hostState = snackbarHostState,
+                        modifier  = Modifier
+                            .align(Alignment.BottomCenter)
+                            .navigationBarsPadding()
+                            .padding(bottom = 80.dp)
+                    )
                 }
-
-                SnackbarHost(
-                    hostState = snackbarHostState,
-                    modifier  = Modifier
-                        .align(Alignment.BottomCenter)
-                        .navigationBarsPadding()
-                        .padding(bottom = 80.dp)
-                )
             }
         }
     }

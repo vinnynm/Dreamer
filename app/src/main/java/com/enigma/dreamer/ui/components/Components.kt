@@ -30,7 +30,7 @@ import com.enigma.dreamer.ui.theme.*
 
 @Composable
 fun AlbumArtwork(
-    song: Song,           // non-nullable — callers handle the null check before calling
+    song: Song,
     modifier: Modifier = Modifier,
     size: Dp = 56.dp,
     shape: Shape = RoundedCornerShape(12.dp)
@@ -42,7 +42,6 @@ fun AlbumArtwork(
             .background(Surface3),
         contentAlignment = Alignment.Center
     ) {
-        // FIX: was `song?.albumArtUri` — song is non-nullable here, safe-call was misleading
         if (song.albumArtUri != null) {
             AsyncImage(
                 model = ImageRequest.Builder(LocalContext.current)
@@ -198,7 +197,7 @@ fun SongListItem(
     trailingContent: (@Composable () -> Unit)? = null
 ) {
     val bgColor by animateColorAsState(
-        if (isPlaying) Surface3 else Color.Transparent, label = "bg"
+        if (isPlaying) Surface3 else Color.Transparent, label = "row_bg"
     )
     Row(
         modifier = Modifier

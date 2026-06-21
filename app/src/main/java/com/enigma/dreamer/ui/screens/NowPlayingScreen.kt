@@ -24,6 +24,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.*
 import com.enigma.dreamer.core.BufferingState
 import com.enigma.dreamer.core.PlaybackState
+import com.enigma.dreamer.core.RepeatMode as AppRepeatMode   // ← disambiguate from animation RepeatMode
 import com.enigma.dreamer.ui.components.AlbumArtwork
 import com.enigma.dreamer.ui.components.LyricLineItem
 import com.enigma.dreamer.ui.components.PlaybackControls
@@ -37,7 +38,7 @@ fun NowPlayingScreen(
     currentLyricLine: Int,
     showLyrics: Boolean,
     showQueue: Boolean,
-    dominantColor: Int = 0xFF0D0D0D.toInt(),
+    dominantColor:   Int = 0xFF0D0D0D.toInt(),
     accentTextColor: Int = 0xFFEEEEEE.toInt(),
     onPlayPause: () -> Unit,
     onNext: () -> Unit,
@@ -55,7 +56,6 @@ fun NowPlayingScreen(
     onBack: () -> Unit,
     onSkipToQueue: (Int) -> Unit
 ) {
-    // FIX: was `song!!` — guard at the top, show nothing if no song loaded yet
     val song        = playbackState.currentSong ?: return
     val lyricsState = rememberLazyListState()
     val isPreparing = playbackState.bufferingState == BufferingState.PREPARING
@@ -131,7 +131,6 @@ fun NowPlayingScreen(
                         modifier  = Modifier.weight(1f),
                         textAlign = TextAlign.Center
                     )
-                    // Favourite
                     val favTint by animateColorAsState(
                         if (song.isFavorite) Amber else fgComposeColor.copy(alpha = 0.6f),
                         label = "fav"
@@ -145,7 +144,6 @@ fun NowPlayingScreen(
                             modifier = Modifier.size(22.dp)
                         )
                     }
-                    // Lyrics toggle
                     IconButton(onClick = onToggleLyrics) {
                         Icon(
                             Icons.Filled.Lyrics, "Lyrics",
@@ -153,7 +151,6 @@ fun NowPlayingScreen(
                             modifier = Modifier.size(22.dp)
                         )
                     }
-                    // Options dropdown — speed + sleep timer
                     Box {
                         IconButton(onClick = { showOptionsMenu = true }) {
                             Icon(
@@ -163,14 +160,14 @@ fun NowPlayingScreen(
                             )
                         }
                         OptionsDropdown(
-                            expanded           = showOptionsMenu,
-                            onDismiss          = { showOptionsMenu = false },
-                            currentSpeed       = playbackState.playbackSpeed,
-                            sleepTimerActive   = playbackState.sleepTimer.isActive,
+                            expanded            = showOptionsMenu,
+                            onDismiss           = { showOptionsMenu = false },
+                            currentSpeed        = playbackState.playbackSpeed,
+                            sleepTimerActive    = playbackState.sleepTimer.isActive,
                             sleepTimerRemaining = playbackState.sleepTimer.remainingMs,
-                            onSpeedChange      = { onSpeedChange(it); showOptionsMenu = false },
-                            onStartSleepTimer  = { onStartSleepTimer(it); showOptionsMenu = false },
-                            onCancelSleepTimer = { onCancelSleepTimer(); showOptionsMenu = false }
+                            onSpeedChange       = { onSpeedChange(it); showOptionsMenu = false },
+                            onStartSleepTimer   = { onStartSleepTimer(it); showOptionsMenu = false },
+                            onCancelSleepTimer  = { onCancelSleepTimer(); showOptionsMenu = false }
                         )
                     }
                 }
@@ -190,47 +187,58 @@ fun NowPlayingScreen(
                             .scale(artScale),
                         contentAlignment = Alignment.Center
                     ) {
-                        // Soft glow / shadow - consistent with artwork shape
                         val artShape = RoundedCornerShape(16.dp)
                         Box(
                             modifier = Modifier
                                 .size(260.dp)
                                 .shadow(
-                                    elevation = if (playbackState.isPlaying) 30.dp else 10.dp,
-                                    shape     = artShape,
+                                    elevation    = if (playbackState.isPlaying) 30.dp else 10.dp,
+                                    shape        = artShape,
                                     ambientColor = bgColor,
                                     spotColor    = bgColor
                                 )
                         )
-                        
-                        // Vinyl Disk (slightly larger, behind artwork)
-                        val rotation by animateFloatAsState(
-                            targetValue = if (playbackState.isPlaying) 360f else 0f,
+
+                        // ── Vinyl disk ─────────────────────────────────────────
+                        // Use infiniteRepeatable with LinearEasing so the rotation
+                        // accumulates continuously — no visual snap back to 0°.
+                        val infiniteTransition = rememberInfiniteTransition(label = "vinyl")
+                        val diskRotation by infiniteTransition.animateFloat(
+                            initialValue  = 0f,
+                            targetValue   = 360f,
                             animationSpec = infiniteRepeatable(
-                                animation = tween(3000, easing = LinearEasing),
-                                repeatMode = RepeatMode.Restart
+                                // RepeatMode here is androidx.compose.animation.core.RepeatMode
+                                animation  = tween(durationMillis = 3000, easing = LinearEasing),
+                                repeatMode = RepeatMode.Restart          // compose animation RepeatMode
                             ),
                             label = "diskRotation"
                         )
-                        
+                        // Pause rotation by freezing at current angle when not playing
+                        val frozenAngle  = remember { mutableFloatStateOf(0f) }
+                        val displayAngle = if (playbackState.isPlaying) {
+                            frozenAngle.floatValue = diskRotation
+                            diskRotation
+                        } else {
+                            frozenAngle.floatValue
+                        }
+
                         Box(
                             modifier = Modifier
                                 .size(268.dp)
-                                .rotate(if (playbackState.isPlaying) rotation else 0f)
+                                .rotate(displayAngle)
                                 .background(Color(0xFF111111), CircleShape)
                                 .border(0.5.dp, Color.White.copy(alpha = 0.1f), CircleShape),
                             contentAlignment = Alignment.Center
                         ) {
-                            // Disk grooves
                             Canvas(modifier = Modifier.fillMaxSize()) {
                                 val center = size.center
                                 val radius = size.minDimension / 2
                                 for (i in 1..8) {
                                     drawCircle(
-                                        color = Color.White.copy(alpha = 0.03f),
+                                        color  = Color.White.copy(alpha = 0.03f),
                                         radius = radius * (0.4f + i * 0.07f),
                                         center = center,
-                                        style = Stroke(width = 1.dp.toPx())
+                                        style  = Stroke(width = 1.dp.toPx())
                                     )
                                 }
                             }
@@ -297,7 +305,6 @@ fun NowPlayingScreen(
 
                 Spacer(Modifier.height(20.dp))
 
-                // ── Seek slider ───────────────────────────────────────────────
                 PlaybackSlider(
                     positionMs = playbackState.positionMs,
                     durationMs = playbackState.durationMs,
@@ -308,7 +315,6 @@ fun NowPlayingScreen(
 
                 Spacer(Modifier.height(6.dp))
 
-                // ── Transport controls ────────────────────────────────────────
                 PlaybackControls(
                     isPlaying       = playbackState.isPlaying,
                     isPreparing     = isPreparing,
@@ -326,7 +332,6 @@ fun NowPlayingScreen(
 
                 Spacer(Modifier.height(8.dp))
 
-                // ── Bottom chips row ──────────────────────────────────────────
                 Row(
                     modifier              = Modifier
                         .fillMaxWidth()
@@ -334,7 +339,6 @@ fun NowPlayingScreen(
                     verticalAlignment     = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    // Speed chip (indicator — tapping opens options menu)
                     if (playbackState.playbackSpeed != 1.0f) {
                         AssistChip(
                             onClick = { showOptionsMenu = true },
@@ -356,7 +360,6 @@ fun NowPlayingScreen(
                         Spacer(Modifier.size(1.dp))
                     }
 
-                    // Sleep timer chip (indicator — tapping opens options menu)
                     if (playbackState.sleepTimer.isActive) {
                         val rem  = playbackState.sleepTimer.remainingMs
                         val mins = rem / 60000
@@ -377,7 +380,6 @@ fun NowPlayingScreen(
                         )
                     }
 
-                    // Queue button
                     IconButton(onClick = onToggleQueue) {
                         Icon(
                             Icons.AutoMirrored.Filled.QueueMusic, "Queue",
@@ -411,7 +413,6 @@ private fun OptionsDropdown(
         onDismissRequest = onDismiss,
         containerColor   = Surface2
     ) {
-        // ── Speed section ─────────────────────────────────────────────────────
         DropdownMenuItem(
             text    = { Text("Playback Speed", style = MaterialTheme.typography.labelSmall, color = Amber) },
             onClick = {},
@@ -441,7 +442,6 @@ private fun OptionsDropdown(
 
         HorizontalDivider(color = Surface3, modifier = Modifier.padding(vertical = 4.dp))
 
-        // ── Sleep timer section ───────────────────────────────────────────────
         DropdownMenuItem(
             text    = { Text("Sleep Timer", style = MaterialTheme.typography.labelSmall, color = Amber) },
             onClick = {},
