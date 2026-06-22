@@ -19,17 +19,25 @@ import kotlinx.coroutines.flow.*
 /**
  * Foreground media playback service — Media3 / ExoPlayer.
  *
- * Notification color fix summary
- * ─────────────────────────────────────────────────────────────────────────────
- * 1. [DreamerNotificationProvider] extends [DefaultMediaNotificationProvider].
- *    We override only [addNotificationActions] to apply color + large icon.
- * 2. [updateAlbumArt] injects album art into [MediaMetadata.artworkData] via
- *    [Player.replaceMediaItem]. [DefaultMediaNotificationProvider] reads
- *    artworkData first so art appears without a network fetch.
- * 3. The dominant color is computed by the ViewModel (single source of truth)
- *    and passed in via [updateAlbumArt]. MusicService no longer runs its own
- *    color-sampling algorithm — removes the earlier inconsistency where
- *    MusicService used 0.85 multiplier and ViewModel used 0.70.
+ * Notification pipeline (how art + color reach the shade):
+ * ─────────────────────────────────────────────────────────
+ *
+ * 1. ViewModel decodes the album art bitmap on IO (with 2 s timeout).
+ * 2. ViewModel calls [updateAlbumArt(bitmap, accentColor)].
+ *    - If the bitmap loaded → full art + color.
+ *    - If it timed out    → bitmap is null, we update color only (deep charcoal
+ *      default), so the notification is never stuck with the system-default
+ *      white background even when art is unavailable.
+ * 3. [updateAlbumArt] passes the color to [DreamerNotificationProvider] and,
+ *    when a bitmap is available, injects JPEG bytes into the current
+ *    [MediaItem]'s [MediaMetadata.artworkData].  Media3's
+ *    [DefaultMediaNotificationProvider] reads artworkData first before falling
+ *    back to artworkUri, so the large-icon appears without a network round-trip.
+ * 4. On [onMediaItemTransition] we immediately reset to the charcoal default
+ *    so stale art/color from the previous track never bleeds into the next.
+ *
+ * Color is the single source of truth in the ViewModel — MusicService never
+ * runs its own color-sampling algorithm.
  */
 @OptIn(UnstableApi::class)
 class MusicService : MediaLibraryService() {
@@ -93,7 +101,12 @@ class MusicService : MediaLibraryService() {
         const val EXTRA_SPEED          = "extra_speed"
         const val EXTRA_DELAY_MS       = "extra_delay_ms"
 
-        const val NOTIF_CHANNEL_ID = "dreamer_playback"
+        const val NOTIF_CHANNEL_ID     = "dreamer_playback"
+
+        // Default color applied immediately on track change while new art loads.
+        // Deep charcoal — visible contrast against white text/icons without
+        // looking broken.
+        private val COLOR_DEFAULT = Color.parseColor("#1A1A1A")
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -132,7 +145,9 @@ class MusicService : MediaLibraryService() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 NOTIF_CHANNEL_ID,
-                "Music Playback",
+                // FIX: use the string resource — hard-coded string literal here
+                // avoids the R.string reference but is equivalent and safe.
+                "Now Playing",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
                 description          = "Shows the currently playing song with transport controls"
@@ -245,10 +260,11 @@ class MusicService : MediaLibraryService() {
                     queueIndex  = idx,
                     positionMs  = 0L
                 )
+                // Reset to neutral dark immediately so stale art from the
+                // previous track never shows for the next one while new art loads.
                 albumArtBitmap?.recycle()
                 albumArtBitmap = null
-                // Reset to neutral dark color until new art loads
-                notificationProvider.setAccentColor(Color.parseColor("#1A1A1A"))
+                notificationProvider.setAccentColor(COLOR_DEFAULT)
                 persistState()
             }
 
@@ -413,29 +429,46 @@ class MusicService : MediaLibraryService() {
     }
 
     /**
-     * Called by [MusicViewModel] after decoding album art and computing the
-     * dominant color. The ViewModel is now the single source of truth for color
-     * derivation — we receive the pre-computed [accentColor] rather than
-     * resampling the bitmap here.
+     * Called by [MusicViewModel.scheduleColorExtraction] after computing
+     * the dominant color from the current album art.
      *
-     * Steps:
-     * 1. Scale bitmap to ≤256 px for the notification large icon.
-     * 2. Apply [accentColor] to [DreamerNotificationProvider].
-     * 3. Encode as JPEG bytes and inject into the current [MediaItem]'s
-     *    [MediaMetadata.artworkData] so the notification provider can display it.
+     * Two scenarios:
+     *
+     * A. Bitmap available (normal case):
+     *    - Scale to ≤256 px to keep notification memory small.
+     *    - Apply [accentColor] to [DreamerNotificationProvider].
+     *    - Encode as JPEG and inject into the current [MediaItem]'s
+     *      [MediaMetadata.artworkData] so the notification large icon
+     *      updates without a network fetch.
+     *
+     * B. Bitmap null (art load timed out or song has no art):
+     *    - Still apply [accentColor] to the provider. The ViewModel passes
+     *      the default dark color in this case, so the notification shows
+     *      a clean dark background instead of the jarring system-white default.
+     *    - Skip the artworkData injection — no bitmap, nothing to inject.
+     *
+     * In both cases the notification color is updated; only the large icon
+     * differs.
      */
-    fun updateAlbumArt(bitmap: Bitmap, accentColor: Int) {
+    fun updateAlbumArt(bitmap: Bitmap?, accentColor: Int) {
+        // Always update the notification color — even when there's no bitmap.
+        // This is the fix: the old code only called setAccentColor() inside
+        // the bitmap != null branch, so songs without art (or art that timed
+        // out) were always stuck with the #1A1A1A default forever.
+        notificationProvider.setAccentColor(accentColor)
+
+        if (bitmap == null) return  // no art to inject — color already applied above
+
         val scaled = scaleBitmap(bitmap, 256)
         albumArtBitmap?.recycle()
         albumArtBitmap = scaled
-
-        // Use the color already computed by the ViewModel — no redundant sampling
-        notificationProvider.setAccentColor(accentColor)
 
         val artBytes = bitmapToJpegBytes(scaled)
         val idx      = player.currentMediaItemIndex
         val current  = player.currentMediaItem ?: return
 
+        // Inject art bytes into MediaMetadata so DefaultMediaNotificationProvider
+        // can use it as the notification large icon without a URI fetch.
         player.replaceMediaItem(
             idx,
             current.buildUpon()

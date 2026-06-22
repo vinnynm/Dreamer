@@ -14,8 +14,8 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.*
-import androidx.compose.ui.geometry.center
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.geometry.center
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
@@ -23,15 +23,18 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.*
+import androidx.core.net.toUri
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
+import com.enigma.devlyric.core.LyricDocument
+import com.enigma.devlyric.core.LyricLine
 import com.enigma.dreamer.R
 import com.enigma.dreamer.core.BufferingState
 import com.enigma.dreamer.core.PlaybackState
 import com.enigma.dreamer.core.RepeatMode as AppRepeatMode
 import com.enigma.dreamer.core.Song
-import com.enigma.dreamer.ui.components.AlbumArtwork
 import com.enigma.dreamer.ui.components.LyricLineItem
 import com.enigma.dreamer.ui.components.PlaybackControls
 import com.enigma.dreamer.ui.components.PlaybackSlider
@@ -84,7 +87,6 @@ fun NowPlayingScreen(
         }
     }
 
-    // "Next up" song — the item after the current queue index
     val nextSong: Song? = remember(playbackState.queue, playbackState.queueIndex) {
         playbackState.queue.getOrNull(playbackState.queueIndex + 1)
     }
@@ -92,9 +94,6 @@ fun NowPlayingScreen(
     Box(modifier = Modifier.fillMaxSize()) {
 
         // ── Layer 1: blurred album art atmosphere ─────────────────────────────
-        // Renders the album art at full screen size with a heavy blur so the
-        // dominant hues bleed into the background without distracting from the
-        // content. The gradient overlay on Layer 2 controls opacity.
         AsyncImage(
             model = ImageRequest.Builder(LocalContext.current)
                 .data(song.albumArtUri)
@@ -106,12 +105,10 @@ fun NowPlayingScreen(
             contentScale       = ContentScale.Crop,
             modifier           = Modifier
                 .fillMaxSize()
-                .blur(60.dp)           // heavy blur — only color/mood leaks through
+                .blur(60.dp)
         )
 
         // ── Layer 2: dominant-color gradient overlay ──────────────────────────
-        // Sits on top of the blur. The gradient is dark at top and bottom so
-        // controls are always legible regardless of album art color.
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -214,88 +211,13 @@ fun NowPlayingScreen(
                 if (!showLyrics || song.lyricDocument == null) {
                     Spacer(Modifier.weight(0.3f))
 
-                    val artScale by animateFloatAsState(
-                        if (playbackState.isPlaying) 1f else 0.88f,
-                        animationSpec = spring(Spring.DampingRatioMediumBouncy),
-                        label         = "artScale"
+                    // ── Vinyl disc (frozen-angle, properly circular) ──────────
+                    VinylDisc(
+                        song       = song,
+                        isPlaying  = playbackState.isPlaying,
+                        bgColor    = bgColor,
+                        modifier   = Modifier.align(Alignment.CenterHorizontally)
                     )
-
-                    Box(
-                        modifier         = Modifier
-                            .align(Alignment.CenterHorizontally)
-                            .scale(artScale),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        val artShape = RoundedCornerShape(16.dp)
-
-                        // Glow shadow
-                        Box(
-                            modifier = Modifier
-                                .size(260.dp)
-                                .shadow(
-                                    elevation    = if (playbackState.isPlaying) 32.dp else 10.dp,
-                                    shape        = artShape,
-                                    ambientColor = bgColor,
-                                    spotColor    = bgColor
-                                )
-                        )
-
-                        // ── Vinyl disc (frozen-angle) ─────────────────────────
-                        var frozenAngle by remember { mutableFloatStateOf(0f) }
-                        val infiniteTransition = rememberInfiniteTransition(label = "vinylSpin")
-                        val liveAngle by infiniteTransition.animateFloat(
-                            initialValue  = 0f,
-                            targetValue   = 360f,
-                            animationSpec = infiniteRepeatable(
-                                animation  = tween(3000, easing = LinearEasing),
-                                repeatMode = androidx.compose.animation.core.RepeatMode.Restart
-                            ),
-                            label = "diskLiveAngle"
-                        )
-                        LaunchedEffect(playbackState.isPlaying, liveAngle) {
-                            if (playbackState.isPlaying) frozenAngle = liveAngle
-                        }
-                        val displayAngle = if (playbackState.isPlaying) liveAngle else frozenAngle
-
-                        Box(
-                            modifier = Modifier
-                                .size(268.dp)
-                                .rotate(displayAngle)
-                                .background(Color(0xFF111111), CircleShape)
-                                .border(0.5.dp, Color.White.copy(alpha = 0.1f), CircleShape),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Canvas(modifier = Modifier.fillMaxSize()) {
-                                val center = size.center
-                                val radius = size.minDimension / 2
-                                for (i in 1..8) {
-                                    drawCircle(
-                                        color  = Color.White.copy(alpha = 0.03f),
-                                        radius = radius * (0.4f + i * 0.07f),
-                                        center = center,
-                                        style  = Stroke(width = 1.dp.toPx())
-                                    )
-                                }
-                            }
-                        }
-
-                        AlbumArtwork(
-                            song     = song,
-                            size     = 272.dp,
-                            shape    = artShape,
-                            modifier = Modifier.border(
-                                1.dp, Color.White.copy(alpha = 0.1f), artShape
-                            )
-                        )
-
-                        if (isPreparing) {
-                            CircularProgressIndicator(
-                                color       = Amber,
-                                strokeWidth = 3.dp,
-                                modifier    = Modifier.size(48.dp)
-                            )
-                        }
-                    }
 
                     Spacer(Modifier.weight(0.3f))
                 } else {
@@ -443,8 +365,6 @@ fun NowPlayingScreen(
                 }
 
                 // ── Next Up peek ──────────────────────────────────────────────
-                // Shows the upcoming song so the user knows what's coming next.
-                // Mirrors the DreamMusic pattern but styled to match Dreamer.
                 AnimatedVisibility(
                     visible = nextSong != null && !showLyrics,
                     enter   = fadeIn() + expandVertically(),
@@ -468,11 +388,26 @@ fun NowPlayingScreen(
                                 color    = fgComposeColor.copy(alpha = 0.45f),
                                 modifier = Modifier.width(36.dp)
                             )
-                            AlbumArtwork(
-                                song  = next,
-                                size  = 36.dp,
-                                shape = RoundedCornerShape(6.dp)
-                            )
+                            // Next song art — small circle
+                            Box(
+                                modifier         = Modifier
+                                    .size(36.dp)
+                                    .clip(CircleShape)
+                                    .background(Surface3),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                AsyncImage(
+                                    model = ImageRequest.Builder(LocalContext.current)
+                                        .data(next.albumArtUri)
+                                        .crossfade(true)
+                                        .placeholder(R.drawable.ic_default_album_art)
+                                        .error(R.drawable.ic_default_album_art)
+                                        .build(),
+                                    contentDescription = null,
+                                    contentScale       = ContentScale.Crop,
+                                    modifier           = Modifier.fillMaxSize()
+                                )
+                            }
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
                                     next.title,
@@ -500,6 +435,124 @@ fun NowPlayingScreen(
 
                 Spacer(Modifier.height(16.dp))
             }
+        }
+    }
+}
+
+// ── Vinyl Disc Composable ─────────────────────────────────────────────────────
+//
+// Previously the vinyl was a Box > (background circle + AlbumArtwork with
+// RoundedCornerShape(16.dp)).  AlbumArtwork draws a *rounded square*, not a
+// circle, so the album art punched a square hole through the vinyl grooves.
+//
+// Fix: clip the album art to CircleShape here, inside the component that owns
+// the vinyl layout.  AlbumArtwork is not used so we control the shape directly.
+
+@Composable
+private fun VinylDisc(
+    song: Song,
+    isPlaying: Boolean,
+    bgColor: Color,
+    modifier: Modifier = Modifier
+) {
+    // Frozen-angle spin: when paused, the disc holds its last angle instead of
+    // snapping back to 0°, which avoids a jarring visual jump.
+    var frozenAngle by remember { mutableFloatStateOf(0f) }
+    val infiniteTransition = rememberInfiniteTransition(label = "vinylSpin")
+    val liveAngle by infiniteTransition.animateFloat(
+        initialValue  = 0f,
+        targetValue   = 360f,
+        animationSpec = infiniteRepeatable(
+            animation  = tween(3000, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "vinylLiveAngle"
+    )
+    LaunchedEffect(isPlaying, liveAngle) {
+        if (isPlaying) frozenAngle = liveAngle
+    }
+    val displayAngle = if (isPlaying) liveAngle else frozenAngle
+
+    // Breathing scale: very subtle pulse when playing
+    val artScale by animateFloatAsState(
+        targetValue   = if (isPlaying) 1f else 0.93f,
+        animationSpec = spring(Spring.DampingRatioMediumBouncy),
+        label         = "vinylScale"
+    )
+
+    Box(
+        modifier         = modifier
+            .size(272.dp)
+            .scale(artScale),
+        contentAlignment = Alignment.Center
+    ) {
+        // 1. Glow shadow ring
+        Box(
+            modifier = Modifier
+                .size(272.dp)
+                .shadow(
+                    elevation = if (isPlaying) 40.dp else 12.dp,
+                    shape = CircleShape,
+                    ambientColor = bgColor,
+                    spotColor = bgColor
+                )
+        )
+
+        // 2. Black vinyl base + groove rings (rotate with the disc)
+        Box(
+            modifier = Modifier
+                .size(272.dp)
+                .rotate(displayAngle)           // ← whole disc rotates
+                .background(Color(0xFF111111), CircleShape)
+                .border(0.5.dp, Color.White.copy(alpha = 0.08f), CircleShape),
+            contentAlignment = Alignment.Center
+        ) {
+            // Groove rings drawn on a Canvas so they rotate with the disc
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val center = size.center
+                val radius = size.minDimension / 2f
+                for (i in 1..8) {
+                    drawCircle(
+                        color  = Color.White.copy(alpha = 0.04f),
+                        radius = radius * (0.38f + i * 0.07f),
+                        center = center,
+                        style  = Stroke(width = 1.dp.toPx())
+                    )
+                }
+            }
+
+            // 3. Album art clipped to a circle — THIS is the fix.
+            //    Previously AlbumArtwork used RoundedCornerShape(16.dp),
+            //    rendering a square-ish shape inside the circular vinyl.
+            AsyncImage(
+                model = ImageRequest.Builder(LocalContext.current)
+                    .data(song.albumArtUri)
+                    .crossfade(true)
+                    .placeholder(R.drawable.ic_default_album_art)
+                    .error(R.drawable.ic_default_album_art)
+                    .build(),
+                contentDescription = "Album art",
+                contentScale       = ContentScale.Crop,
+                modifier           = Modifier
+                    .size(250.dp)           // art occupies the inner 73% of the disc
+                    .clip(CircleShape)      // ← clipped to circle, matching the vinyl
+            )
+
+            // 4. Centre label ring (dark semi-transparent)
+            Box(
+                modifier = Modifier
+                    .size(72.dp)
+                    .clip(CircleShape)
+                    .background(Color.Black.copy(alpha = 0.55f))
+            )
+
+            // 5. Spindle dot
+            Box(
+                modifier = Modifier
+                    .size(14.dp)
+                    .clip(CircleShape)
+                    .background(bgColor.copy(alpha = 0.9f))
+            )
         }
     }
 }
@@ -610,4 +663,81 @@ private fun OptionsDropdown(
             }
         }
     }
+}
+
+
+@Preview
+@Composable
+private fun NowPlayingPrev() {
+    NowPlayingScreen(
+        playbackState = PlaybackState(
+            currentSong = Song(
+                id = 1,
+                title = "Ariana",
+                artist = "Diamond Platinum",
+                album = "Dims",
+                duration = 400,
+                uri = "".toUri(),
+                lyricDocument = LyricDocument(
+                    title = "Ariana",
+                    artist = "Diamond Platinum",
+                    album = "Dims",
+                    offsetMs = 5,
+                    lines = listOf(
+                        LyricLine(timestampMs = 0L, "Shine bright like a diamond"),
+                        LyricLine(timestampMs = 5L, "Shine bright like a diamond"),
+                        LyricLine(timestampMs = 9L, "Find light in the beautiful sea"),
+                        LyricLine(timestampMs = 13L, "I choose to be happy"),
+                        LyricLine(timestampMs = 17L, "You and I, you and I"),
+                        LyricLine(timestampMs = 21L, "We're like diamonds in the sky")
+                    )
+                )
+            ),
+            positionMs = 250000,
+            durationMs = 400000,
+            queue = listOf(
+                Song(
+                    id = 1,
+                    title = "Ariana1",
+                    artist = "Diamond Platinum",
+                    album = "Dims",
+                    duration = 400,
+                    uri = "".toUri()
+                ),
+                Song(
+                    id = 1,
+                    title = "Ariana2",
+                    artist = "Diamond Platinum",
+                    album = "Dims",
+                    duration = 400,
+                    uri = "".toUri()
+                ),
+                Song(
+                    id = 1,
+                    title = "Ariana3",
+                    artist = "Diamond Platinum",
+                    album = "Dims",
+                    duration = 400,
+                    uri = "".toUri()
+                ),
+            )
+        ),
+        currentLyricLine = 2,
+        showLyrics = false,
+        showQueue = false,
+        onPlayPause = {},
+        onNext = {},
+        onPrevious = {},
+        onSeek = {},
+        onToggleRepeat = {},
+        onToggleShuffle = {},
+        onToggleLyrics = {},
+        onToggleFavorite = {},
+        onToggleQueue = {},
+        onSpeedChange = {},
+        onStartSleepTimer = {},
+        onCancelSleepTimer = {},
+        onOpenSettings = {},
+        onBack = {}
+    ) { }
 }
