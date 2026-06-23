@@ -66,7 +66,19 @@ fun NowPlayingScreen(
     onBack: () -> Unit,
     onSkipToQueue: (Int) -> Unit
 ) {
-    val song        = playbackState.currentSong ?: return
+    // FIX B-2: The original code used `val song = playbackState.currentSong ?: return`,
+    // which emitted a completely blank (transparent/black) composable when no song was
+    // loaded — no message, no back button, no navigation. This happened reliably when
+    // the user tapped the notification before the session had finished restoring.
+    //
+    // Now we render a proper "Nothing playing" empty state with a back button so the
+    // user is never stuck staring at a void with no way out.
+    val song = playbackState.currentSong
+    if (song == null) {
+        NowPlayingEmptyState(onBack = onBack)
+        return
+    }
+
     val lyricsState = rememberLazyListState()
     val isPreparing = playbackState.bufferingState == BufferingState.PREPARING
 
@@ -211,7 +223,6 @@ fun NowPlayingScreen(
                 if (!showLyrics || song.lyricDocument == null) {
                     Spacer(Modifier.weight(0.3f))
 
-                    // ── Vinyl disc (frozen-angle, properly circular) ──────────
                     VinylDisc(
                         song       = song,
                         isPlaying  = playbackState.isPlaying,
@@ -221,7 +232,6 @@ fun NowPlayingScreen(
 
                     Spacer(Modifier.weight(0.3f))
                 } else {
-                    // ── Lyric player ──────────────────────────────────────────
                     LazyColumn(
                         state               = lyricsState,
                         modifier            = Modifier
@@ -388,7 +398,6 @@ fun NowPlayingScreen(
                                 color    = fgComposeColor.copy(alpha = 0.45f),
                                 modifier = Modifier.width(36.dp)
                             )
-                            // Next song art — small circle
                             Box(
                                 modifier         = Modifier
                                     .size(36.dp)
@@ -439,14 +448,63 @@ fun NowPlayingScreen(
     }
 }
 
+// ── Empty state — FIX B-2 ────────────────────────────────────────────────────
+
+/**
+ * Shown when [NowPlayingScreen] is opened but no song is loaded yet — e.g. the
+ * user tapped the notification before the session restore completed, or navigated
+ * here from a deep link with an empty queue.
+ *
+ * Previously the screen was completely blank (bare `return` in a Composable),
+ * leaving the user stranded with no UI and no way to go back. This replaces that
+ * with a minimal but complete empty state that includes a working back button.
+ */
+@Composable
+private fun NowPlayingEmptyState(onBack: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Amoled)
+            .statusBarsPadding()
+            .navigationBarsPadding()
+    ) {
+        IconButton(
+            onClick  = onBack,
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(4.dp)
+        ) {
+            Icon(
+                Icons.Filled.KeyboardArrowDown, "Back",
+                tint     = TextSecondary,
+                modifier = Modifier.size(28.dp)
+            )
+        }
+        Column(
+            modifier            = Modifier.align(Alignment.Center),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Icon(
+                Icons.Filled.MusicNote, null,
+                tint     = TextMuted,
+                modifier = Modifier.size(64.dp)
+            )
+            Text(
+                "Nothing playing",
+                style = MaterialTheme.typography.titleMedium,
+                color = TextMuted
+            )
+            Text(
+                "Pick a song from the library",
+                style = MaterialTheme.typography.bodySmall,
+                color = TextMuted
+            )
+        }
+    }
+}
+
 // ── Vinyl Disc Composable ─────────────────────────────────────────────────────
-//
-// Previously the vinyl was a Box > (background circle + AlbumArtwork with
-// RoundedCornerShape(16.dp)).  AlbumArtwork draws a *rounded square*, not a
-// circle, so the album art punched a square hole through the vinyl grooves.
-//
-// Fix: clip the album art to CircleShape here, inside the component that owns
-// the vinyl layout.  AlbumArtwork is not used so we control the shape directly.
 
 @Composable
 private fun VinylDisc(
@@ -455,8 +513,6 @@ private fun VinylDisc(
     bgColor: Color,
     modifier: Modifier = Modifier
 ) {
-    // Frozen-angle spin: when paused, the disc holds its last angle instead of
-    // snapping back to 0°, which avoids a jarring visual jump.
     var frozenAngle by remember { mutableFloatStateOf(0f) }
     val infiniteTransition = rememberInfiniteTransition(label = "vinylSpin")
     val liveAngle by infiniteTransition.animateFloat(
@@ -473,7 +529,6 @@ private fun VinylDisc(
     }
     val displayAngle = if (isPlaying) liveAngle else frozenAngle
 
-    // Breathing scale: very subtle pulse when playing
     val artScale by animateFloatAsState(
         targetValue   = if (isPlaying) 1f else 0.93f,
         animationSpec = spring(Spring.DampingRatioMediumBouncy),
@@ -486,28 +541,25 @@ private fun VinylDisc(
             .scale(artScale),
         contentAlignment = Alignment.Center
     ) {
-        // 1. Glow shadow ring
         Box(
             modifier = Modifier
                 .size(272.dp)
                 .shadow(
-                    elevation = if (isPlaying) 40.dp else 12.dp,
-                    shape = CircleShape,
+                    elevation    = if (isPlaying) 40.dp else 12.dp,
+                    shape        = CircleShape,
                     ambientColor = bgColor,
-                    spotColor = bgColor
+                    spotColor    = bgColor
                 )
         )
 
-        // 2. Black vinyl base + groove rings (rotate with the disc)
         Box(
             modifier = Modifier
                 .size(272.dp)
-                .rotate(displayAngle)           // ← whole disc rotates
+                .rotate(displayAngle)
                 .background(Color(0xFF111111), CircleShape)
                 .border(0.5.dp, Color.White.copy(alpha = 0.08f), CircleShape),
             contentAlignment = Alignment.Center
         ) {
-            // Groove rings drawn on a Canvas so they rotate with the disc
             Canvas(modifier = Modifier.fillMaxSize()) {
                 val center = size.center
                 val radius = size.minDimension / 2f
@@ -521,9 +573,6 @@ private fun VinylDisc(
                 }
             }
 
-            // 3. Album art clipped to a circle — THIS is the fix.
-            //    Previously AlbumArtwork used RoundedCornerShape(16.dp),
-            //    rendering a square-ish shape inside the circular vinyl.
             AsyncImage(
                 model = ImageRequest.Builder(LocalContext.current)
                     .data(song.albumArtUri)
@@ -534,11 +583,10 @@ private fun VinylDisc(
                 contentDescription = "Album art",
                 contentScale       = ContentScale.Crop,
                 modifier           = Modifier
-                    .size(250.dp)           // art occupies the inner 73% of the disc
-                    .clip(CircleShape)      // ← clipped to circle, matching the vinyl
+                    .size(250.dp)
+                    .clip(CircleShape)
             )
 
-            // 4. Centre label ring (dark semi-transparent)
             Box(
                 modifier = Modifier
                     .size(72.dp)
@@ -546,7 +594,6 @@ private fun VinylDisc(
                     .background(Color.Black.copy(alpha = 0.55f))
             )
 
-            // 5. Spindle dot
             Box(
                 modifier = Modifier
                     .size(14.dp)
@@ -576,13 +623,7 @@ private fun OptionsDropdown(
         containerColor   = Surface2
     ) {
         DropdownMenuItem(
-            text    = {
-                Text(
-                    "Playback Speed",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = Amber
-                )
-            },
+            text    = { Text("Playback Speed", style = MaterialTheme.typography.labelSmall, color = Amber) },
             onClick = {},
             enabled = false
         )
@@ -594,11 +635,7 @@ private fun OptionsDropdown(
                         verticalAlignment     = Alignment.CenterVertically
                     ) {
                         if (currentSpeed == speed)
-                            Icon(
-                                Icons.Filled.Check, null,
-                                tint     = Amber,
-                                modifier = Modifier.size(16.dp)
-                            )
+                            Icon(Icons.Filled.Check, null, tint = Amber, modifier = Modifier.size(16.dp))
                         else
                             Spacer(Modifier.size(16.dp))
                         Text(
@@ -615,13 +652,7 @@ private fun OptionsDropdown(
         HorizontalDivider(color = Surface3, modifier = Modifier.padding(vertical = 4.dp))
 
         DropdownMenuItem(
-            text    = {
-                Text(
-                    "Sleep Timer",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = Amber
-                )
-            },
+            text    = { Text("Sleep Timer", style = MaterialTheme.typography.labelSmall, color = Amber) },
             onClick = {},
             enabled = false
         )
@@ -634,11 +665,7 @@ private fun OptionsDropdown(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalAlignment     = Alignment.CenterVertically
                     ) {
-                        Icon(
-                            Icons.Filled.Bedtime, null,
-                            tint     = Amber,
-                            modifier = Modifier.size(16.dp)
-                        )
+                        Icon(Icons.Filled.Bedtime, null, tint = Amber, modifier = Modifier.size(16.dp))
                         Text(
                             "Cancel (%d:%02d)".format(mins, secs),
                             color = ErrorRed,
@@ -651,13 +678,7 @@ private fun OptionsDropdown(
         } else {
             listOf(5, 10, 15, 20, 30, 45, 60).forEach { minutes ->
                 DropdownMenuItem(
-                    text = {
-                        Text(
-                            "$minutes minutes",
-                            color = TextPrimary,
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-                    },
+                    text    = { Text("$minutes minutes", color = TextPrimary, style = MaterialTheme.typography.bodyMedium) },
                     onClick = { onStartSleepTimer(minutes) }
                 )
             }
@@ -665,6 +686,9 @@ private fun OptionsDropdown(
     }
 }
 
+// ── Preview ───────────────────────────────────────────────────────────────────
+// FIX B-16: All parameters now use named arguments so the trailing lambda
+// is unambiguously bound to onSkipToQueue, not onBack.
 
 @Preview
 @Composable
@@ -672,21 +696,21 @@ private fun NowPlayingPrev() {
     NowPlayingScreen(
         playbackState = PlaybackState(
             currentSong = Song(
-                id = 1,
+                id    = 1,
                 title = "Ariana",
                 artist = "Diamond Platinum",
-                album = "Dims",
+                album  = "Dims",
                 duration = 400,
-                uri = "".toUri(),
+                uri    = "".toUri(),
                 lyricDocument = LyricDocument(
-                    title = "Ariana",
-                    artist = "Diamond Platinum",
-                    album = "Dims",
+                    title    = "Ariana",
+                    artist   = "Diamond Platinum",
+                    album    = "Dims",
                     offsetMs = 5,
-                    lines = listOf(
-                        LyricLine(timestampMs = 0L, "Shine bright like a diamond"),
-                        LyricLine(timestampMs = 5L, "Shine bright like a diamond"),
-                        LyricLine(timestampMs = 9L, "Find light in the beautiful sea"),
+                    lines    = listOf(
+                        LyricLine(timestampMs = 0L,  "Shine bright like a diamond"),
+                        LyricLine(timestampMs = 5L,  "Shine bright like a diamond"),
+                        LyricLine(timestampMs = 9L,  "Find light in the beautiful sea"),
                         LyricLine(timestampMs = 13L, "I choose to be happy"),
                         LyricLine(timestampMs = 17L, "You and I, you and I"),
                         LyricLine(timestampMs = 21L, "We're like diamonds in the sky")
@@ -696,48 +720,55 @@ private fun NowPlayingPrev() {
             positionMs = 250000,
             durationMs = 400000,
             queue = listOf(
-                Song(
-                    id = 1,
-                    title = "Ariana1",
-                    artist = "Diamond Platinum",
-                    album = "Dims",
-                    duration = 400,
-                    uri = "".toUri()
-                ),
-                Song(
-                    id = 1,
-                    title = "Ariana2",
-                    artist = "Diamond Platinum",
-                    album = "Dims",
-                    duration = 400,
-                    uri = "".toUri()
-                ),
-                Song(
-                    id = 1,
-                    title = "Ariana3",
-                    artist = "Diamond Platinum",
-                    album = "Dims",
-                    duration = 400,
-                    uri = "".toUri()
-                ),
+                Song(id = 1, title = "Ariana1", artist = "Diamond Platinum", album = "Dims", duration = 400, uri = "".toUri()),
+                Song(id = 2, title = "Ariana2", artist = "Diamond Platinum", album = "Dims", duration = 400, uri = "".toUri()),
+                Song(id = 3, title = "Ariana3", artist = "Diamond Platinum", album = "Dims", duration = 400, uri = "".toUri()),
             )
         ),
-        currentLyricLine = 2,
-        showLyrics = false,
-        showQueue = false,
-        onPlayPause = {},
-        onNext = {},
-        onPrevious = {},
-        onSeek = {},
-        onToggleRepeat = {},
-        onToggleShuffle = {},
-        onToggleLyrics = {},
-        onToggleFavorite = {},
-        onToggleQueue = {},
-        onSpeedChange = {},
-        onStartSleepTimer = {},
+        currentLyricLine   = 2,
+        showLyrics         = false,
+        showQueue          = false,
+        onPlayPause        = {},
+        onNext             = {},
+        onPrevious         = {},
+        onSeek             = {},
+        onToggleRepeat     = {},
+        onToggleShuffle    = {},
+        onToggleLyrics     = {},
+        onToggleFavorite   = {},
+        onToggleQueue      = {},
+        onSpeedChange      = {},
+        onStartSleepTimer  = {},
         onCancelSleepTimer = {},
-        onOpenSettings = {},
-        onBack = {}
-    ) { }
+        onOpenSettings     = {},
+        onBack             = {},
+        onSkipToQueue      = {}   // FIX B-16: named, no ambiguous trailing lambda
+    )
+}
+
+@Preview
+@Composable
+private fun NowPlayingEmptyPrev() {
+    // Verify the empty state renders correctly for B-2
+    NowPlayingScreen(
+        playbackState      = PlaybackState(currentSong = null),
+        currentLyricLine   = -1,
+        showLyrics         = false,
+        showQueue          = false,
+        onPlayPause        = {},
+        onNext             = {},
+        onPrevious         = {},
+        onSeek             = {},
+        onToggleRepeat     = {},
+        onToggleShuffle    = {},
+        onToggleLyrics     = {},
+        onToggleFavorite   = {},
+        onToggleQueue      = {},
+        onSpeedChange      = {},
+        onStartSleepTimer  = {},
+        onCancelSleepTimer = {},
+        onOpenSettings     = {},
+        onBack             = {},
+        onSkipToQueue      = {}
+    )
 }

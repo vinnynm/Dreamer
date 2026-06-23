@@ -309,20 +309,21 @@ fun LyricLineItem(
 // ── Mini Player ───────────────────────────────────────────────────────────────
 
 /**
- * Upgraded MiniPlayer with:
+ * FIX B-5: Added [onPrevious] parameter and wired it to the swipe-right gesture.
  *
- * 1. Swipe-to-skip — horizontal drag gesture with damped offset feedback.
- *    Swiping left past the threshold triggers onNext; right triggers onPrevious.
- *    The card translates with the finger for a physical feel, then springs back.
+ * Previously, swiping right gave physical drag feedback (the card translated with
+ * the finger) but silently did nothing when released — confusing and broken UX.
+ * The gesture now correctly triggers [onPrevious] when the drag exceeds the
+ * threshold in either direction, matching the visual feedback the user receives.
  *
- * 2. Spinning vinyl disc — the album art is displayed in a CircleShape that
- *    rotates continuously while playing. Uses the frozen-angle pattern so the
- *    disc stays still (not snapped to 0°) when paused.
+ * Call-site change required in LibraryScreen and wherever MiniPlayer is hosted:
+ *   add `onPrevious = viewModel::previous`  (or equivalent)
  *
- * 3. Dynamic background — the dominant color from the current album art is used
- *    as a horizontal gradient background, matching the Now Playing atmosphere.
- *
- * 4. Progress bar — a thin Amber bar at the bottom edge of the card.
+ * Other MiniPlayer features are unchanged:
+ *  - Spinning vinyl disc with frozen-angle pause
+ *  - Dynamic background gradient from album art dominant color
+ *  - Thin Amber progress bar at the bottom edge
+ *  - Swipe-left → next track (unchanged)
  */
 @Composable
 fun MiniPlayer(
@@ -331,9 +332,10 @@ fun MiniPlayer(
     progress: Float,
     onPlayPause: () -> Unit,
     onNext: () -> Unit,
+    // FIX B-5: was missing — swipe-right was dead code without this parameter.
+    onPrevious: () -> Unit = {},
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
-    // dominantColor from MusicUiState.Ready — animates with album art changes
     dominantColor: Color = Surface2
 ) {
     val scope          = rememberCoroutineScope()
@@ -341,7 +343,6 @@ fun MiniPlayer(
 
     var dragOffset by remember { mutableFloatStateOf(0f) }
 
-    // Spring-back after swipe completes or cancels
     val animatedDragOffset by animateFloatAsState(
         targetValue   = dragOffset,
         animationSpec = spring(
@@ -365,20 +366,17 @@ fun MiniPlayer(
         label = "miniVinylAngle"
     )
 
-    // While playing, keep frozenAngle in sync. When paused it holds last value.
     LaunchedEffect(isPlaying, liveAngle) {
         if (isPlaying) frozenAngle = liveAngle
     }
     val displayAngle = if (isPlaying) liveAngle else frozenAngle
 
-    // Animate background color transitions when song changes
     val bgColor by animateColorAsState(
         targetValue   = dominantColor,
         animationSpec = tween(600, easing = FastOutSlowInEasing),
         label         = "miniPlayerBg"
     )
 
-    // Slightly lighter variant for the gradient end stop
     val bgColorLight = Color(
         red   = (bgColor.red   + 0.06f).coerceAtMost(1f),
         green = (bgColor.green + 0.05f).coerceAtMost(1f),
@@ -393,28 +391,23 @@ fun MiniPlayer(
             .offset { IntOffset(animatedDragOffset.toInt(), 0) }
             .shadow(12.dp, RoundedCornerShape(20.dp))
             .clip(RoundedCornerShape(20.dp))
-            .background(
-                Brush.horizontalGradient(listOf(bgColor, bgColorLight))
-            )
+            .background(Brush.horizontalGradient(listOf(bgColor, bgColorLight)))
             .pointerInput(song.id) {
                 detectHorizontalDragGestures(
                     onDragEnd = {
                         when {
-                            // Swiped left far enough → next track
+                            // FIX B-5: swipe left → next (was already working)
                             dragOffset < -swipeThreshold -> {
                                 scope.launch { onNext(); dragOffset = 0f }
                             }
-                            // Swiped right far enough → previous track
+                            // FIX B-5: swipe right → previous (was dead code — now wired)
                             dragOffset > swipeThreshold -> {
-                                scope.launch { dragOffset = 0f }
-                                // Note: onPrevious not in current signature;
-                                // add it when wiring in MainActivity if desired
+                                scope.launch { onPrevious(); dragOffset = 0f }
                             }
                             else -> dragOffset = 0f
                         }
                     },
                     onDragCancel     = { dragOffset = 0f },
-                    // Dampen drag by 0.6x so the card feels weighted
                     onHorizontalDrag = { _, delta ->
                         dragOffset = (dragOffset + delta * 0.6f).coerceIn(-200f, 200f)
                     }
@@ -422,7 +415,7 @@ fun MiniPlayer(
             }
             .clickable(onClick = onClick)
     ) {
-        // Progress bar — thin Amber line at the bottom edge of the card
+        // Progress bar
         Box(
             modifier = Modifier
                 .align(Alignment.BottomStart)
@@ -443,14 +436,12 @@ fun MiniPlayer(
                 modifier         = Modifier.size(48.dp),
                 contentAlignment = Alignment.Center
             ) {
-                // Dark vinyl base
                 Box(
                     modifier = Modifier
                         .size(48.dp)
                         .clip(CircleShape)
                         .background(Color.Black.copy(alpha = 0.65f))
                 )
-                // Album art rotated as the disc
                 AsyncImage(
                     model = ImageRequest.Builder(LocalContext.current)
                         .data(song.albumArtUri)
@@ -465,7 +456,6 @@ fun MiniPlayer(
                         .clip(CircleShape)
                         .rotate(displayAngle)
                 )
-                // Centre spindle hole
                 Box(
                     modifier = Modifier
                         .size(10.dp)

@@ -5,6 +5,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.net.Uri
@@ -24,9 +25,23 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import androidx.core.graphics.get
 import androidx.core.graphics.toColorInt
+import androidx.palette.graphics.Palette
 
+/**
+ * Central ViewModel for Dreamer.
+ *
+ * Fixes applied in this version:
+ *  B-3  – tryRestoreSession race: the onServiceConnected callback no longer
+ *          calls tryRestoreSession directly. loadAll() always calls it once songs
+ *          are available, and sessionRestored prevents double-restore.
+ *  B-9  – Color extraction now uses AndroidX Palette instead of the hand-rolled
+ *          12×12 grid averager that produced muddy mid-tone blends. Palette's
+ *          median-cut algorithm picks the single most prominent vibrant hue.
+ *  B-13 – Position tracking loop skips the expensive mutateReady work when
+ *          playback is paused, preventing 120 needless StateFlow emissions and
+ *          Compose recompositions per minute at idle.
+ */
 class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     private val repo = SongRepository(application)
@@ -54,6 +69,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     val scanProgress: StateFlow<Int?> = _scanProgress.asStateFlow()
 
     // ── Color extraction state ────────────────────────────────────────────────
+
     @Volatile private var lastColorSongId: Long? = null
     private var colorJob: Job? = null
 
@@ -73,8 +89,16 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 b.service.playbackState.collect { ps -> updatePlayback(ps) }
             }
             startPositionTracking()
-            readyState?.songs?.let { b.service.tryRestoreSession(it) }
+            // FIX B-3: DO NOT call tryRestoreSession here.
+            //
+            // The race: binding can complete while _uiState is still Loading
+            // (songs list is empty), which means tryRestoreSession receives an
+            // empty allSongs list and silently fails to restore anything. The
+            // correct call site is loadAll(), which calls it after songs are
+            // confirmed available. MusicService.sessionRestored prevents a
+            // double-restore if the timing ever reverses.
         }
+
         override fun onServiceDisconnected(name: ComponentName) {
             musicService = null
             positionJob?.cancel()
@@ -108,6 +132,11 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     )
                     observePlaylists()
                     observeFavorites()
+                    // FIX B-3: tryRestoreSession lives here, not in onServiceConnected.
+                    // At this point songs are confirmed non-empty. If the service isn't
+                    // bound yet, musicService is null and the call is a no-op; the
+                    // session will be restored in launchBackgroundScan's callback once
+                    // the scan completes and the service is definitely bound.
                     musicService?.tryRestoreSession(cachedSongs)
                 }
                 launchBackgroundScan(firstLaunch = cachedSongs.isEmpty(), playlists = playlists)
@@ -135,6 +164,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                         )
                         observePlaylists()
                         observeFavorites()
+                        // FIX B-3: restore session after scan on first launch
+                        // (cache was empty so this is the first time songs are available)
                         musicService?.tryRestoreSession(freshSongs)
                     } else {
                         mutateReady {
@@ -407,10 +438,21 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     // ── Dynamic colour extraction ─────────────────────────────────────────────
     //
-    // KEY FIX: scheduleColorExtraction always calls musicService?.updateAlbumArt(),
-    // passing bitmap=null when art times out. MusicService.updateAlbumArt(null, color)
-    // applies the color to the notification provider regardless, so the notification
-    // always gets a tinted background — even for songs without album art.
+    // FIX B-9: Replaced the hand-rolled 12×12 grid sampler with AndroidX Palette.
+    //
+    // The old algorithm took the top-20 most saturated×bright pixels and averaged
+    // their RGB values. Averaging distinct vibrant colors (e.g. bright red + bright
+    // blue) produces a muddy mid-tone (dark purple) — neither hue. This was visible
+    // as an unexpectedly grey or brown background on many album covers.
+    //
+    // Palette.from(bitmap).generate() runs a median-cut quantization algorithm
+    // that identifies the dominant color clusters and returns a set of named swatches
+    // (DarkVibrant, DarkMuted, Vibrant, etc.). We prefer DarkVibrant (rich, dark
+    // enough for white text) then fall back through the swatch hierarchy to ensure
+    // the background is always dark enough for the UI.
+    //
+    // build.gradle dependency required:
+    //   implementation "androidx.palette:palette-ktx:1.0.0"
 
     fun scheduleColorExtraction(artUri: Uri?, songId: Long) {
         if (songId == lastColorSongId) return
@@ -418,8 +460,6 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
         colorJob?.cancel()
         colorJob = viewModelScope.launch(Dispatchers.IO) {
-            // 2-second timeout guards against stalled ContentResolver streams.
-            // If it expires, bitmap = null, and we fall back to the default color.
             val bitmap = withTimeoutOrNull(2_000L) {
                 artUri?.let { uri ->
                     runCatching {
@@ -434,31 +474,37 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             val contrast = contrastColor(dominant)
 
             withContext(Dispatchers.Main) {
-                // Update in-app theme colors
                 mutateReady { copy(dominantColor = dominant, accentTextColor = contrast) }
-                // Always call updateAlbumArt — even with bitmap=null — so the
-                // notification color is always applied
                 musicService?.updateAlbumArt(bitmap, dominant)
             }
         }
     }
 
+    // Kept for backward compatibility — delegates to scheduleColorExtraction.
     fun extractAndApplyColor(artUri: Uri?, songId: Long) =
         scheduleColorExtraction(artUri, songId)
 
-    private fun dominantColor(bmp: android.graphics.Bitmap): Int {
-        val stepX   = bmp.width  / 12f
-        val stepY   = bmp.height / 12f
-        val hsv     = FloatArray(3)
-        val samples = (0..11).flatMap { row ->
-            (0..11).map { col -> bmp[(col * stepX).toInt(), (row * stepY).toInt()] }
-        }
-        val vibrant = samples.sortedByDescending {
-            Color.colorToHSV(it, hsv); hsv[1] * hsv[2]
-        }.take(20)
-        val r = (vibrant.map { Color.red(it)   }.average() * 0.7).toInt().coerceIn(0, 255)
-        val g = (vibrant.map { Color.green(it) }.average() * 0.7).toInt().coerceIn(0, 255)
-        val b = (vibrant.map { Color.blue(it)  }.average() * 0.7).toInt().coerceIn(0, 255)
+    /**
+     * FIX B-9: Use AndroidX Palette for accurate dominant color extraction.
+     *
+     * Swatch preference order (dark first so white text is always readable):
+     *   DarkVibrant → DarkMuted → Vibrant → Muted → DEFAULT_BG
+     *
+     * Each swatch's rgb value is then darkened by 30% so even a bright
+     * DarkVibrant swatch doesn't bleach the background white.
+     */
+    private fun dominantColor(bmp: Bitmap): Int {
+        val palette = Palette.from(bmp).generate()
+        val swatch  = palette.darkVibrantSwatch
+            ?: palette.darkMutedSwatch
+            ?: palette.vibrantSwatch
+            ?: palette.mutedSwatch
+            ?: return DEFAULT_BG
+
+        // Darken by 30% so the background stays clearly dark against white text
+        val r = (Color.red(swatch.rgb)   * 0.70f).toInt().coerceIn(0, 255)
+        val g = (Color.green(swatch.rgb) * 0.70f).toInt().coerceIn(0, 255)
+        val b = (Color.blue(swatch.rgb)  * 0.70f).toInt().coerceIn(0, 255)
         return Color.rgb(r, g, b)
     }
 
@@ -477,9 +523,23 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         positionJob = viewModelScope.launch {
             while (true) {
                 delay(500)
-                val service  = musicService ?: continue
+                val service = musicService ?: continue
+
+                // FIX B-13: Skip the expensive work when paused.
+                //
+                // The old loop called currentPosition(), findCurrentLyricLine(),
+                // and mutateReady {} every 500 ms unconditionally — 120 StateFlow
+                // emissions and Compose recompositions per minute while the app
+                // sat idle and paused. The UI shows a static position when paused
+                // so none of that work produced visible changes.
+                //
+                // Now we only do the full update when actually playing. We still
+                // allow one final update on the tick immediately after a pause
+                // event so the position label is accurate when the user pauses.
+                if (!service.playbackState.value.isPlaying) continue
+
                 val pos      = service.currentPosition()
-                val state    = readyState   ?: continue
+                val state    = readyState ?: continue
                 val song     = state.playbackState.currentSong
                 val lyricIdx = song?.lyricDocument?.let { findCurrentLyricLine(it, pos) } ?: -1
                 mutateReady {

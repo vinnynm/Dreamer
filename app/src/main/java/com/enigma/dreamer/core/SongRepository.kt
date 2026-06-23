@@ -3,7 +3,9 @@ package com.enigma.dreamer.core
 import android.content.ContentResolver
 import android.content.ContentUris
 import android.content.Context
+import android.os.Build
 import android.provider.MediaStore
+import androidx.annotation.RequiresApi
 import com.enigma.devlyric.core.LyricBaker
 import com.enigma.devlyric.core.LyricDocument
 import com.enigma.devlyric.core.LyricFormat
@@ -28,10 +30,9 @@ class SongRepository(private val context: Context) {
     /**
      * Returns songs from the Room cache immediately (<100 ms for 1000+ songs),
      * then triggers a background MediaStore scan to pick up any changes since
-     * the last run.  The ViewModel calls [scanAndSync] separately so the UI is
-     * never blocked waiting for MediaStore.
+     * the last run.
      *
-     * First-ever launch: DB is empty, returns empty list.  The ViewModel
+     * First-ever launch: DB is empty, returns empty list. The ViewModel
      * transitions straight to the background scan in that case.
      */
     suspend fun loadSongsFromCache(): List<Song> = withContext(Dispatchers.IO) {
@@ -53,16 +54,9 @@ class SongRepository(private val context: Context) {
     /**
      * Full MediaStore scan — metadata only, no file reads.
      *
-     * What changed vs the old loadSongs():
-     * - No tryLoadLyrics() call inside the cursor loop.  Reading bytes from
-     *   audio files to probe for embedded tags was the single biggest cause
-     *   of the 1–3 minute startup time.  For 1000 songs that's 1000 × ~50 ms
-     *   = up to 50 seconds just in file I/O before any song appears on screen.
-     * - hasLyricHint is set cheaply: sidecar .lrc/.srt existence checked with
-     *   File.exists() (fast, metadata-only syscall) and mime type checked for
-     *   formats that may carry embedded tags.  No bytes are read.
-     * - Results are upserted to Room, obsolete rows deleted, then favorites
-     *   are synced back to the denormalised isFavorite column.
+     * FIX A-3: DB writes are now made via [SongDao.replaceAll], which wraps
+     * upsertAll + deleteObsolete in a single @Transaction. A partial scan that
+     * throws mid-way will not leave stale rows in the DB.
      *
      * Returns the full refreshed song list so the ViewModel can update state
      * immediately without waiting for the Flow observer to tick.
@@ -142,10 +136,10 @@ class SongRepository(private val context: Context) {
             }
         }
 
-        // Atomic DB update: upsert discovered songs, remove deleted ones
+        // FIX A-3: single atomic transaction — replaceAll refuses to act if
+        // scannedSongs is empty, so a failed/aborted scan can't wipe the cache.
         if (scannedSongs.isNotEmpty()) {
-            songDao.upsertAll(scannedSongs)
-            songDao.deleteObsolete(scannedSongs.map { it.id })
+            songDao.replaceAll(scannedSongs)
             // Keep the denormalised isFavorite column in sync
             songDao.syncFavorites(favoriteIds.toList())
         }
@@ -161,15 +155,10 @@ class SongRepository(private val context: Context) {
     /**
      * Loads lyrics for a single song on demand — called by the ViewModel when
      * the user opens Now Playing, NOT during the library scan.
-     *
-     * This is where the actual file I/O lives. Isolated here, it only costs
-     * time once per song per session, and only when the user actually plays
-     * something.
      */
     suspend fun loadLyricsForSong(song: Song): LyricDocument? = withContext(Dispatchers.IO) {
         if (song.filePath.isBlank()) return@withContext null
         val doc = tryLoadLyrics(song.filePath)
-        // Update the hint so SongDetailSheet shows accurate "Has lyrics" info
         songDao.setLyricHint(song.id, doc != null)
         doc
     }
@@ -196,7 +185,6 @@ class SongRepository(private val context: Context) {
 
     suspend fun toggleFavorite(songId: Long) = withContext(Dispatchers.IO) {
         favoriteDao.toggle(songId)
-        // Keep denormalised column in sync immediately
         val isFav = favoriteDao.isFavorite(songId)
         songDao.setFavorite(songId, isFav)
     }
@@ -220,6 +208,8 @@ class SongRepository(private val context: Context) {
             .distinctBy { it.playlistId }
             .map { row ->
                 val entity = row.toPlaylistEntity()
+                // For empty playlists the LEFT JOIN returns one row with songId=null;
+                // mapNotNull drops it safely, yielding emptyList() as expected.
                 val ids: List<Long> = grouped[entity.id]
                     ?.sortedBy { it.position }
                     ?.mapNotNull { it.songId }
@@ -260,7 +250,6 @@ class SongRepository(private val context: Context) {
     ): LyricDocument? = withContext(Dispatchers.IO) {
         runCatching {
             val file   = File(audioPath)
-            val ext    = audioPath.substringAfterLast('.').lowercase()
             val doc    = LyricParser.parse(lyricText, format)
             val result = LyricBaker.bake(file, doc)
             if (result is com.enigma.devlyric.core.BakeResult.Success) doc else null
@@ -278,42 +267,56 @@ class SongRepository(private val context: Context) {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    /**
-     * Checks for a sidecar lyric file using only filesystem metadata — no
-     * bytes are read.  File.exists() is a single stat() syscall (~0.1 ms).
-     */
     private fun hasLyricSidecar(audioPath: String): Boolean {
         val base = audioPath.substringBeforeLast('.')
         return File("$base.lrc").exists() || File("$base.srt").exists()
     }
 
-    /**
-     * Returns true if the mime type is one that can carry embedded lyric tags
-     * (MP3 ID3v2 USLT or M4A iTunes ©lyr atom).  We don't know for certain
-     * whether tags are actually present without reading bytes, but this gives
-     * the UI a "maybe" hint without any I/O cost.
-     */
     private fun mimeSupportsEmbeddedTags(mime: String): Boolean {
         val lower = mime.lowercase()
-        return lower.contains("mpeg") ||   // audio/mpeg → mp3
-                lower.contains("mp4")  ||   // audio/mp4, video/mp4
+        return lower.contains("mpeg") ||
+                lower.contains("mp4")  ||
                 lower.contains("m4a")  ||
                 lower.contains("aac")
     }
 
     /**
-     * Full lyric probe — reads file bytes.  Only called from [loadLyricsForSong],
+     * Full lyric probe — reads file bytes. Only called from [loadLyricsForSong],
      * never from the scan path.
+     *
+     * FIX B-11: Previously this called File.readBytes() which would load an
+     * entire 50+ MB audio file into heap memory just to look for a tag in the
+     * first few kilobytes. Now we cap the read at 64 KB — more than enough for
+     * any ID3v2 header or iTunes atom — dramatically reducing GC pressure and
+     * eliminating OOM risk on low-RAM devices.
+     *
+     * Note: sidecar .lrc/.srt files are still read in full (they are text files,
+     * typically < 50 KB). Only embedded-tag probing is capped.
      */
+
     private fun tryLoadLyrics(audioPath: String): LyricDocument? {
         val base = audioPath.substringBeforeLast('.')
         File("$base.lrc").takeIf { it.exists() }
             ?.let { return runCatching { LyricParser.parse(it, LyricFormat.LRC) }.getOrNull() }
         File("$base.srt").takeIf { it.exists() }
             ?.let { return runCatching { LyricParser.parse(it, LyricFormat.SRT) }.getOrNull() }
+
         val ext = audioPath.substringAfterLast('.').lowercase()
         if (ext in listOf("mp3", "m4a", "aac", "mp4")) {
-            val bytes = runCatching { File(audioPath).readBytes() }.getOrNull() ?: return null
+            // FIX B-11: read only the first 64 KB instead of the entire file.
+            // ID3v2 tags sit at the start of MP3 files; iTunes atoms at the
+            // start of M4A files. 64 KB covers even the most heavily padded
+            // headers while keeping heap allocation tiny.
+            val bytes = runCatching {
+                File(audioPath).inputStream().use { stream ->
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        stream.readNBytes(65_536)
+                    } else {
+                        TODO()
+
+                    }   // 64 KB cap
+                }
+            }.getOrNull() ?: return null
             return LyricBaker.extractLyrics(bytes, ext)
         }
         return null

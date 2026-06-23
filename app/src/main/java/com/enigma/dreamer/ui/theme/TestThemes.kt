@@ -1,6 +1,10 @@
 package com.enigma.dreamer.ui.theme
 
-import android.system.Os.close
+// FIX B-15: Removed `import android.system.Os.close` — this was a dead import
+// that referenced a low-level native file-descriptor closer completely unrelated
+// to anything in this file. It generated a lint warning and was confusing to readers.
+// No functional change; the September and Icicle composables are unchanged.
+
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -30,7 +34,7 @@ fun September(modifier: Modifier = Modifier) {
         0.7f to LightWood,
         1.0f to WoodBrown,
         start = Offset(0f, 0f),
-        end = Offset(100f, 200f) // Angled grain
+        end   = Offset(100f, 200f)
     )
 
     Box(
@@ -40,12 +44,11 @@ fun September(modifier: Modifier = Modifier) {
             .background(woodBrush, shape = RoundedCornerShape(4.dp))
             .drawWithContent {
                 drawContent()
-                // Optional: Draw very thin, darker lines for extra "grain"
                 for (i in 0..10) {
                     drawLine(
-                        color = Color.Black.copy(alpha = 0.1f),
-                        start = Offset(i * 20f, 0f),
-                        end = Offset(i * 20f + 10f, size.height),
+                        color       = Color.Black.copy(alpha = 0.1f),
+                        start       = Offset(i * 20f, 0f),
+                        end         = Offset(i * 20f + 10f, size.height),
                         strokeWidth = 1f
                     )
                 }
@@ -68,15 +71,11 @@ fun Icicle(modifier: Modifier = Modifier) {
         modifier = Modifier
             .size(64.dp)
             .background(
-                brush = Brush.verticalGradient(
-                    colors = listOf(IceBlue, DeepIce)
-                ),
+                brush = Brush.verticalGradient(colors = listOf(IceBlue, DeepIce)),
                 shape = RoundedCornerShape(8.dp)
             )
-
             .border(1.dp, Color.White.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
     ) {
-        // Add a "Gloss" overlay
         Canvas(modifier = Modifier.matchParentSize()) {
             val path = Path().apply {
                 moveTo(0f, 0f)
@@ -84,10 +83,7 @@ fun Icicle(modifier: Modifier = Modifier) {
                 lineTo(0f, size.height * 0.5f)
                 close()
             }
-            drawPath(
-                path = path,
-                color = Color.White.copy(alpha = 0.3f)
-            )
+            drawPath(path = path, color = Color.White.copy(alpha = 0.3f))
         }
     }
 }

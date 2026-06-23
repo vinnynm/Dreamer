@@ -16,29 +16,6 @@ import com.google.common.util.concurrent.ListenableFuture
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 
-/**
- * Foreground media playback service — Media3 / ExoPlayer.
- *
- * Notification pipeline (how art + color reach the shade):
- * ─────────────────────────────────────────────────────────
- *
- * 1. ViewModel decodes the album art bitmap on IO (with 2 s timeout).
- * 2. ViewModel calls [updateAlbumArt(bitmap, accentColor)].
- *    - If the bitmap loaded → full art + color.
- *    - If it timed out    → bitmap is null, we update color only (deep charcoal
- *      default), so the notification is never stuck with the system-default
- *      white background even when art is unavailable.
- * 3. [updateAlbumArt] passes the color to [DreamerNotificationProvider] and,
- *    when a bitmap is available, injects JPEG bytes into the current
- *    [MediaItem]'s [MediaMetadata.artworkData].  Media3's
- *    [DefaultMediaNotificationProvider] reads artworkData first before falling
- *    back to artworkUri, so the large-icon appears without a network round-trip.
- * 4. On [onMediaItemTransition] we immediately reset to the charcoal default
- *    so stale art/color from the previous track never bleeds into the next.
- *
- * Color is the single source of truth in the ViewModel — MusicService never
- * runs its own color-sampling algorithm.
- */
 @OptIn(UnstableApi::class)
 class MusicService : MediaLibraryService() {
 
@@ -72,7 +49,10 @@ class MusicService : MediaLibraryService() {
 
     // ── Album art ─────────────────────────────────────────────────────────────
 
-    private var albumArtBitmap: Bitmap? = null
+    // FIX B-17: guard against concurrent recycle by always null-checking and
+    // clearing the reference before recycling, so onDestroy + updateAlbumArt
+    // racing can't double-recycle the same bitmap.
+    @Volatile private var albumArtBitmap: Bitmap? = null
 
     // ── Sleep timer ───────────────────────────────────────────────────────────
 
@@ -103,9 +83,6 @@ class MusicService : MediaLibraryService() {
 
         const val NOTIF_CHANNEL_ID     = "dreamer_playback"
 
-        // Default color applied immediately on track change while new art loads.
-        // Deep charcoal — visible contrast against white text/icons without
-        // looking broken.
         private val COLOR_DEFAULT = Color.parseColor("#1A1A1A")
     }
 
@@ -125,17 +102,27 @@ class MusicService : MediaLibraryService() {
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
-        persistState()
+        // FIX A-4: use commit() here so state is flushed to disk before the
+        // process is killed.  apply() is async and may not complete in time
+        // when the system tears down the process immediately after onTaskRemoved.
+        persistStateSync()
         if (!player.isPlaying) stopSelf()
     }
 
     override fun onDestroy() {
-        persistState()
+        // FIX A-4: commit() in onDestroy for the same reason — we're about to
+        // lose the process and async apply() is not guaranteed to flush in time.
+        persistStateSync()
         cancelSleepTimer()
         serviceScope.cancel()
         mediaSession.release()
         player.release()
-        albumArtBitmap?.recycle()
+        // FIX B-17: clear reference before recycling so a concurrent
+        // updateAlbumArt call that checks albumArtBitmap sees null instead of
+        // a recycled bitmap.
+        val bmp = albumArtBitmap
+        albumArtBitmap = null
+        bmp?.recycle()
         super.onDestroy()
     }
 
@@ -145,8 +132,6 @@ class MusicService : MediaLibraryService() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 NOTIF_CHANNEL_ID,
-                // FIX: use the string resource — hard-coded string literal here
-                // avoids the R.string reference but is equivalent and safe.
                 "Now Playing",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
@@ -260,10 +245,10 @@ class MusicService : MediaLibraryService() {
                     queueIndex  = idx,
                     positionMs  = 0L
                 )
-                // Reset to neutral dark immediately so stale art from the
-                // previous track never shows for the next one while new art loads.
-                albumArtBitmap?.recycle()
+                // FIX B-17: clear reference before recycling (same pattern as onDestroy)
+                val bmp = albumArtBitmap
                 albumArtBitmap = null
+                bmp?.recycle()
                 notificationProvider.setAccentColor(COLOR_DEFAULT)
                 persistState()
             }
@@ -306,7 +291,17 @@ class MusicService : MediaLibraryService() {
     fun setQueue(queue: List<Song>, index: Int) {
         val ps = _playbackState.value
 
-        if (queue === originalQueue || (queue.size == originalQueue.size && queue == originalQueue)) {
+        // FIX B-4: the old check used structural equality on List<Song>, which
+        // compares every field including lyricDocument (a complex object with
+        // many LyricLine instances).  For a 1000-song library with loaded lyrics
+        // that's potentially millions of field comparisons on every playSong call.
+        //
+        // Now we compare only song IDs, which is O(n) with a tiny constant and
+        // covers all practical "is this the same queue?" scenarios.
+        val isSameQueue = queue.size == originalQueue.size &&
+                queue.zip(originalQueue).all { (a, b) -> a.id == b.id }
+
+        if (isSameQueue) {
             val song = queue.getOrNull(index)
             val effectiveIdx = if (ps.shuffleMode == ShuffleMode.ON) {
                 ps.queue.indexOfFirst { it.id == song?.id }.coerceAtLeast(0)
@@ -428,47 +423,21 @@ class MusicService : MediaLibraryService() {
         _playbackState.value = _playbackState.value.copy(sleepTimer = SleepTimer())
     }
 
-    /**
-     * Called by [MusicViewModel.scheduleColorExtraction] after computing
-     * the dominant color from the current album art.
-     *
-     * Two scenarios:
-     *
-     * A. Bitmap available (normal case):
-     *    - Scale to ≤256 px to keep notification memory small.
-     *    - Apply [accentColor] to [DreamerNotificationProvider].
-     *    - Encode as JPEG and inject into the current [MediaItem]'s
-     *      [MediaMetadata.artworkData] so the notification large icon
-     *      updates without a network fetch.
-     *
-     * B. Bitmap null (art load timed out or song has no art):
-     *    - Still apply [accentColor] to the provider. The ViewModel passes
-     *      the default dark color in this case, so the notification shows
-     *      a clean dark background instead of the jarring system-white default.
-     *    - Skip the artworkData injection — no bitmap, nothing to inject.
-     *
-     * In both cases the notification color is updated; only the large icon
-     * differs.
-     */
     fun updateAlbumArt(bitmap: Bitmap?, accentColor: Int) {
-        // Always update the notification color — even when there's no bitmap.
-        // This is the fix: the old code only called setAccentColor() inside
-        // the bitmap != null branch, so songs without art (or art that timed
-        // out) were always stuck with the #1A1A1A default forever.
         notificationProvider.setAccentColor(accentColor)
 
-        if (bitmap == null) return  // no art to inject — color already applied above
+        if (bitmap == null) return
 
         val scaled = scaleBitmap(bitmap, 256)
-        albumArtBitmap?.recycle()
+        // FIX B-17: clear reference before recycling
+        val old = albumArtBitmap
         albumArtBitmap = scaled
+        old?.recycle()
 
         val artBytes = bitmapToJpegBytes(scaled)
         val idx      = player.currentMediaItemIndex
         val current  = player.currentMediaItem ?: return
 
-        // Inject art bytes into MediaMetadata so DefaultMediaNotificationProvider
-        // can use it as the notification large icon without a URI fetch.
         player.replaceMediaItem(
             idx,
             current.buildUpon()
@@ -527,6 +496,8 @@ class MusicService : MediaLibraryService() {
 
     // ── Persistence ───────────────────────────────────────────────────────────
 
+    // FIX A-4: async path — safe for normal playback events (isPlaying changes,
+    // seek, etc.) because the process stays alive long enough for apply() to flush.
     private fun persistState() {
         val ps = _playbackState.value
         prefs.edit()
@@ -536,7 +507,25 @@ class MusicService : MediaLibraryService() {
             .putLong("position_ms", currentPosition())
             .putString("repeat",    ps.repeatMode.name)
             .putString("shuffle",   ps.shuffleMode.name)
-            .apply()
+            .apply()   // async — fine for normal events
+    }
+
+    // FIX A-4: synchronous path — used in onTaskRemoved() and onDestroy() where
+    // the process may be terminated immediately after this call returns. apply()
+    // in those contexts risks losing state if the OS kills us before the async
+    // write queue drains. commit() blocks the calling thread until the write is
+    // confirmed, which is acceptable here since we're already on a lifecycle
+    // callback (not a hot path).
+    private fun persistStateSync() {
+        val ps = _playbackState.value
+        prefs.edit()
+            .putString("queue_ids", ps.queue.joinToString(",") { it.id.toString() })
+            .putString("orig_ids",  originalQueue.joinToString(",") { it.id.toString() })
+            .putInt("queue_index",  ps.queueIndex)
+            .putLong("position_ms", currentPosition())
+            .putString("repeat",    ps.repeatMode.name)
+            .putString("shuffle",   ps.shuffleMode.name)
+            .commit()   // synchronous — necessary when process may die immediately after
     }
 
     // ── Internal command handlers ─────────────────────────────────────────────

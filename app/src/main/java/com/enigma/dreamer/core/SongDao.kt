@@ -24,23 +24,54 @@ interface SongDao {
 
     // ── Write ─────────────────────────────────────────────────────────────────
 
-    /**
-     * Insert or update. Uses REPLACE strategy so re-scanning simply
-     * overwrites stale metadata without manual diffing.
-     */
     @Upsert
     suspend fun upsertAll(songs: List<SongEntity>)
 
     @Upsert
     suspend fun upsert(song: SongEntity)
 
-    /**
-     * Remove songs that are no longer present in MediaStore.
-     * Called at the end of every scan with the full set of discovered IDs.
-     * Runs in a transaction so observers see the delete atomically.
-     */
+    // FIX B-1: The raw query `DELETE FROM songs WHERE id NOT IN ()` on an empty
+    // list becomes `DELETE FROM songs` in SQLite — a full table wipe.  The DAO
+    // method now contains its own safety net so no caller can ever accidentally
+    // pass an empty list and silently destroy the cache.
+    //
+    // The caller (SongRepository.scanAndSync) already has an `isNotEmpty` guard,
+    // but defence-in-depth at the DAO level means a future refactor can't remove
+    // the outer check and accidentally nuke user data.
+    suspend fun deleteObsolete(activeIds: List<Long>) {
+        if (activeIds.isEmpty()) return   // ← safety net; never wipe on empty scan
+        deleteObsoleteInternal(activeIds)
+    }
+
     @Query("DELETE FROM songs WHERE id NOT IN (:activeIds)")
-    suspend fun deleteObsolete(activeIds: List<Long>)
+    suspend fun deleteObsoleteInternal(activeIds: List<Long>)
+
+    // FIX A-3: Atomic scan write ───────────────────────────────────────────────
+    //
+    // Previously upsertAll + deleteObsolete were two separate non-transactional
+    // calls in SongRepository.scanAndSync(). If the process was killed between
+    // them the DB would hold stale rows that no longer exist on disk, causing
+    // ExoPlayer SOURCE_ERROR when the user tried to play those songs on the next
+    // launch.
+    //
+    // @Transaction makes the pair atomic: either both succeed or neither does.
+    // Room also prevents other DAO calls from interleaving on a separate
+    // connection while the write is in flight.
+
+    /**
+     * Atomically replaces the song cache with [freshSongs] and removes any rows
+     * whose IDs are not in the new set.
+     *
+     * Safe to call from any coroutine dispatcher — Room dispatches DB work on
+     * its own executor. Refuses to wipe the cache when [freshSongs] is empty
+     * (e.g., a failed or interrupted scan).
+     */
+    @Transaction
+    suspend fun replaceAll(freshSongs: List<SongEntity>) {
+        if (freshSongs.isEmpty()) return   // refuse to wipe cache on empty scan
+        upsertAll(freshSongs)
+        deleteObsolete(freshSongs.map { it.id })
+    }
 
     // ── Favorites sync ────────────────────────────────────────────────────────
 

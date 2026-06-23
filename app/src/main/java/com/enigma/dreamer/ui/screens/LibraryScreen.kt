@@ -44,7 +44,6 @@ fun LibraryScreen(
     currentSong: Song?,
     isPlaying: Boolean,
     playbackProgress: Float,
-    // dominant color from current album art — passed to MiniPlayer
     dominantColor: Int = 0xFF161616.toInt(),
     scanProgress: Int? = null,
     onSongClick: (Song) -> Unit,
@@ -63,6 +62,10 @@ fun LibraryScreen(
     onMiniPlayerClick: () -> Unit,
     onMiniPlayPause: () -> Unit,
     onMiniNext: () -> Unit,
+    // FIX B-5: added onMiniPrevious so the swipe-right gesture in MiniPlayer
+    // actually triggers the previous-track action. Wire this to viewModel::previous
+    // in MainActivity / the composable that hosts LibraryScreen.
+    onMiniPrevious: () -> Unit = {},
     onRescan: () -> Unit = {}
 ) {
     val scope      = rememberCoroutineScope()
@@ -105,13 +108,14 @@ fun LibraryScreen(
                         dominantColor = Color(dominantColor),
                         onPlayPause   = onMiniPlayPause,
                         onNext        = onMiniNext,
+                        // FIX B-5: previously omitted — swipe-right was dead code
+                        onPrevious    = onMiniPrevious,
                         onClick       = onMiniPlayerClick
                     )
                 }
             }
         }
     ) { padding ->
-        // HorizontalPager — makes tabs swipeable like DreamMusic
         HorizontalPager(
             state    = pagerState,
             modifier = Modifier.padding(padding)
@@ -259,7 +263,6 @@ private fun LibraryTopBar(
             }
         }
 
-        // Scan progress bar
         AnimatedVisibility(
             visible = isScanning,
             enter   = fadeIn() + expandVertically(),
@@ -418,22 +421,10 @@ fun SongsTab(
     if (songs.isEmpty()) {
         Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Icon(
-                    Icons.Filled.LibraryMusic, null,
-                    tint     = TextMuted,
-                    modifier = Modifier.size(64.dp)
-                )
+                Icon(Icons.Filled.LibraryMusic, null, tint = TextMuted, modifier = Modifier.size(64.dp))
                 Spacer(Modifier.height(12.dp))
-                Text(
-                    "No songs found",
-                    color = TextMuted,
-                    style = MaterialTheme.typography.bodyLarge
-                )
-                Text(
-                    "Add music to your device",
-                    color = TextMuted,
-                    style = MaterialTheme.typography.bodySmall
-                )
+                Text("No songs found", color = TextMuted, style = MaterialTheme.typography.bodyLarge)
+                Text("Add music to your device", color = TextMuted, style = MaterialTheme.typography.bodySmall)
             }
         }
         return
@@ -491,22 +482,10 @@ fun PlaylistsTab(
     if (playlists.isEmpty()) {
         Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Icon(
-                    Icons.AutoMirrored.Filled.QueueMusic, null,
-                    tint     = TextMuted,
-                    modifier = Modifier.size(64.dp)
-                )
+                Icon(Icons.AutoMirrored.Filled.QueueMusic, null, tint = TextMuted, modifier = Modifier.size(64.dp))
                 Spacer(Modifier.height(12.dp))
-                Text(
-                    "No playlists yet",
-                    color = TextMuted,
-                    style = MaterialTheme.typography.bodyLarge
-                )
-                Text(
-                    "Tap + to create one",
-                    color = TextMuted,
-                    style = MaterialTheme.typography.bodySmall
-                )
+                Text("No playlists yet", color = TextMuted, style = MaterialTheme.typography.bodyLarge)
+                Text("Tap + to create one", color = TextMuted, style = MaterialTheme.typography.bodySmall)
             }
         }
         return
@@ -557,11 +536,7 @@ fun PlaylistItem(
                 .background(AmberDim),
             contentAlignment = Alignment.Center
         ) {
-            Icon(
-                Icons.AutoMirrored.Filled.QueueMusic, null,
-                tint     = Amber,
-                modifier = Modifier.size(28.dp)
-            )
+            Icon(Icons.AutoMirrored.Filled.QueueMusic, null, tint = Amber, modifier = Modifier.size(28.dp))
         }
         Column(modifier = Modifier.weight(1f)) {
             Text(
@@ -572,10 +547,7 @@ fun PlaylistItem(
                 maxLines   = 1,
                 overflow   = TextOverflow.Ellipsis
             )
-            Text(
-                "$songCount song${if (songCount != 1) "s" else ""}",
-                style = MaterialTheme.typography.bodySmall
-            )
+            Text("$songCount song${if (songCount != 1) "s" else ""}", style = MaterialTheme.typography.bodySmall)
         }
         Box {
             IconButton(onClick = { showMenu = true }) {
@@ -588,11 +560,7 @@ fun PlaylistItem(
             ) {
                 DropdownMenuItem(
                     text        = { Text("Rename", color = TextPrimary) },
-                    onClick     = {
-                        showMenu   = false
-                        showRename = true
-                        renameText = playlist.name
-                    },
+                    onClick     = { showMenu = false; showRename = true; renameText = playlist.name },
                     leadingIcon = { Icon(Icons.Filled.Edit, null, tint = TextSecondary) }
                 )
                 DropdownMenuItem(
@@ -623,16 +591,11 @@ fun PlaylistItem(
             },
             confirmButton = {
                 TextButton(onClick = {
-                    if (renameText.isNotBlank()) {
-                        onRename(renameText.trim())
-                        showRename = false
-                    }
+                    if (renameText.isNotBlank()) { onRename(renameText.trim()); showRename = false }
                 }) { Text("Save", color = Amber) }
             },
             dismissButton = {
-                TextButton(onClick = { showRename = false }) {
-                    Text("Cancel", color = TextSecondary)
-                }
+                TextButton(onClick = { showRename = false }) { Text("Cancel", color = TextSecondary) }
             }
         )
     }
