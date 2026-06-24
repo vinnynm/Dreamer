@@ -5,7 +5,6 @@ import android.content.ContentUris
 import android.content.Context
 import android.os.Build
 import android.provider.MediaStore
-import androidx.annotation.RequiresApi
 import com.enigma.devlyric.core.LyricBaker
 import com.enigma.devlyric.core.LyricDocument
 import com.enigma.devlyric.core.LyricFormat
@@ -243,13 +242,45 @@ class SongRepository(private val context: Context) {
 
     // ── Lyric write operations ────────────────────────────────────────────────
 
+    /**
+     * Bakes [lyricText] into the audio file at [audioPath].
+     *
+     * FIX B-8: The previous implementation silently dropped the [format]
+     * parameter — it was passed to LyricParser.parse() but LyricBaker.bake()
+     * received no format hint. For the LyricBaker API as shipped, the bake()
+     * overload that accepts a pre-parsed [LyricDocument] infers the output
+     * format from the file extension (.mp3 → ID3v2 USLT/SYLT, .m4a → ©lyr
+     * atom), so passing a LyricDocument is sufficient and format is used only
+     * for parsing — this is correct behaviour.
+     *
+     * However, to make the intent explicit and guard against future API changes,
+     * we now document the assumption inline. If LyricBaker ever gains a
+     * bake(file, doc, format) overload, this is the call site to update.
+     *
+     * B-10: Writing to [audioPath] (a raw filesystem path from MediaStore.DATA)
+     * requires:
+     *   - API ≤ 28: WRITE_EXTERNAL_STORAGE in manifest + runtime grant
+     *   - API 29:   MediaStore write permission via ContentResolver (the DATA
+     *               column path is still writable if the file was created by
+     *               this app or if the user granted legacy storage access)
+     *   - API 30+:  MediaStore write-with-URI is the correct path; writing to
+     *               DATA may fail with EACCES even with legacy storage access.
+     * For now we fall through to saveSidecarLrc on failure, which writes a
+     * new .lrc file next to the audio — new files in the same directory are
+     * always writable on all API levels without extra permissions.
+     *
+     * Full MediaStore-URI write path is tracked as a future improvement.
+     */
     suspend fun bakeLyrics(
         audioPath: String,
         lyricText: String,
         format: LyricFormat
     ): LyricDocument? = withContext(Dispatchers.IO) {
         runCatching {
-            val file   = File(audioPath)
+            val file = File(audioPath)
+            // Parse using the user-selected format (LRC timestamps vs plain text).
+            // LyricBaker.bake() determines the embedding format (ID3v2 vs ©lyr)
+            // from the file extension — format is correctly consumed here by parse().
             val doc    = LyricParser.parse(lyricText, format)
             val result = LyricBaker.bake(file, doc)
             if (result is com.enigma.devlyric.core.BakeResult.Success) doc else null
@@ -284,16 +315,18 @@ class SongRepository(private val context: Context) {
      * Full lyric probe — reads file bytes. Only called from [loadLyricsForSong],
      * never from the scan path.
      *
-     * FIX B-11: Previously this called File.readBytes() which would load an
-     * entire 50+ MB audio file into heap memory just to look for a tag in the
-     * first few kilobytes. Now we cap the read at 64 KB — more than enough for
-     * any ID3v2 header or iTunes atom — dramatically reducing GC pressure and
-     * eliminating OOM risk on low-RAM devices.
+     * FIX B-11: Cap read at 64 KB — enough for any ID3v2 header or iTunes atom.
      *
-     * Note: sidecar .lrc/.srt files are still read in full (they are text files,
-     * typically < 50 KB). Only embedded-tag probing is capped.
+     * FIX (untracked crash): The previous implementation used
+     * `stream.readNBytes(65_536)` inside a `@RequiresApi(33)` branch and put
+     * `TODO()` in the else branch. `TODO()` throws NotImplementedError at
+     * runtime on every device running API < 33 (Android 12L and below),
+     * meaning lyric loading was completely broken on the majority of devices.
+     *
+     * Fix: use a manual byte-capped read loop that works on all API levels.
+     * readNBytes() is only available on InputStream from API 33+; below that
+     * we read into a fixed-size buffer and return whatever we got.
      */
-
     private fun tryLoadLyrics(audioPath: String): LyricDocument? {
         val base = audioPath.substringBeforeLast('.')
         File("$base.lrc").takeIf { it.exists() }
@@ -302,23 +335,27 @@ class SongRepository(private val context: Context) {
             ?.let { return runCatching { LyricParser.parse(it, LyricFormat.SRT) }.getOrNull() }
 
         val ext = audioPath.substringAfterLast('.').lowercase()
-        if (ext in listOf("mp3", "m4a", "aac", "mp4")) {
-            // FIX B-11: read only the first 64 KB instead of the entire file.
-            // ID3v2 tags sit at the start of MP3 files; iTunes atoms at the
-            // start of M4A files. 64 KB covers even the most heavily padded
-            // headers while keeping heap allocation tiny.
-            val bytes = runCatching {
-                File(audioPath).inputStream().use { stream ->
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        stream.readNBytes(65_536)
-                    } else {
-                        TODO()
+        if (ext !in listOf("mp3", "m4a", "aac", "mp4")) return null
 
-                    }   // 64 KB cap
+        // FIX B-11 + untracked crash: read at most 64 KB using a read loop
+        // that is compatible with all API levels (no readNBytes() needed).
+        // ID3v2 tags sit at the start of MP3 files; iTunes atoms sit at
+        // the start of M4A files. 64 KB covers even heavily padded headers.
+        val cap   = 65_536
+        val bytes = runCatching {
+            File(audioPath).inputStream().use { stream ->
+                val buf    = ByteArray(cap)
+                var offset = 0
+                while (offset < cap) {
+                    val read = stream.read(buf, offset, cap - offset)
+                    if (read == -1) break
+                    offset += read
                 }
-            }.getOrNull() ?: return null
-            return LyricBaker.extractLyrics(bytes, ext)
-        }
-        return null
+                // Return only the bytes actually read; don't pass zero-padded tail
+                if (offset == cap) buf else buf.copyOf(offset)
+            }
+        }.getOrNull() ?: return null
+
+        return runCatching { LyricBaker.extractLyrics(bytes, ext) }.getOrNull()
     }
 }

@@ -32,23 +32,38 @@ import com.enigma.dreamer.ui.theme.*
 /**
  * Full-screen lyric editor.
  *
- * Modes:
- *  - RAW  : Free-text editor for LRC / plain text. User types or pastes lyrics.
- *  - LINE : Line-by-line view where each line can be timestamped individually
- *           (useful when listening to the song and tapping timestamps in real-time).
+ * Phase 6 / FIX B-7: The editor is now fully wired to live playback.
  *
- * Workflow:
- *  1. User opens the editor from the Song Detail sheet.
- *  2. The editor pre-fills with existing lyrics (if any).
- *  3. User edits in RAW mode or timestamps in LINE mode.
- *  4. Preview panel shows how the parsed LRC will look.
- *  5. "Save & Bake" embeds lyrics into the audio file (MP3 USLT/SYLT or M4A ©lyr).
- *     For unsupported formats a sidecar .lrc is saved instead.
+ * New parameters vs. the original:
+ *  - [currentPositionMs]   live playback position from MusicViewModel (500 ms poll)
+ *  - [isPlaying]           live playback state
+ *  - [onPlayPause]         forwarded to MusicViewModel.togglePlayPause()
+ *  - [onSeek]              forwarded to MusicViewModel.seekTo()
+ *
+ * What this unlocks (Phase 6 tasks):
+ *  6.1 / 6.2  – position + isPlaying wired from MainActivity → LyricEditorRoute
+ *  6.3        – mini playback bar (play/pause + seek slider) embedded in the editor
+ *  6.4        – LINE mode "Stamp" button: writes currentPositionMs as the
+ *               timestamp for the focused line, then auto-advances to the next
+ *  6.5        – RAW mode LrcHelperBar live-position chip inserts the actual
+ *               playback position instead of a static [00:00.00] template
+ *  6.6        – out-of-order timestamp chips highlighted in red in LINE mode
+ *
+ * Modes:
+ *  RAW  – Free-text editor for LRC / plain text.
+ *  LINE – Line-by-line view; each line can be stamped to the live position
+ *          by tapping the Stamp button while the song plays.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LyricEditorScreen(
     song: Song,
+    // ── Phase 6: live playback parameters ────────────────────────────────────
+    currentPositionMs: Long = 0L,
+    isPlaying: Boolean = false,
+    onPlayPause: () -> Unit = {},
+    onSeek: (Long) -> Unit = {},
+    // ─────────────────────────────────────────────────────────────────────────
     onSaveAndBake: (lyricText: String, format: LyricFormat) -> Unit,
     onBack: () -> Unit,
     isSaving: Boolean = false,
@@ -56,40 +71,42 @@ fun LyricEditorScreen(
 ) {
     // ── Editor state ──────────────────────────────────────────────────────────
 
-    // Initial text: existing LRC if available, else blank
     val initialText = remember(song.id) {
         song.lyricDocument?.toLrcText() ?: ""
     }
 
     var editorMode by remember { mutableStateOf(EditorMode.RAW) }
     var rawText    by remember { mutableStateOf(TextFieldValue(initialText)) }
+    var lineItems  by remember(initialText) { mutableStateOf(parseToLineItems(initialText)) }
 
-    // LINE mode: split the raw text into a mutable list of editable lines
-    var lineItems  by remember(initialText) {
-        mutableStateOf(parseToLineItems(initialText))
-    }
+    // Phase 6.4: track which LINE row the user most recently stamped so we can
+    // auto-advance after each stamp.
+    var stampCursor by remember { mutableIntStateOf(0) }
 
-    // Preview toggle
-    var showPreview by remember { mutableStateOf(false) }
-
-    // Format selector
-    var selectedFormat by remember { mutableStateOf(LyricFormat.LRC) }
-    var showFormatMenu by remember { mutableStateOf(false) }
-
-    // Discard confirmation
+    var showPreview       by remember { mutableStateOf(false) }
+    var selectedFormat    by remember { mutableStateOf(LyricFormat.LRC) }
+    var showFormatMenu    by remember { mutableStateOf(false) }
     var showDiscardDialog by remember { mutableStateOf(false) }
 
-    // Sync raw↔line when switching modes
-    fun syncRawToLine() {
-        lineItems = parseToLineItems(rawText.text)
-    }
-    fun syncLineToRaw() {
-        rawText = TextFieldValue(lineItemsToLrc(lineItems))
-    }
+    fun syncRawToLine() { lineItems = parseToLineItems(rawText.text) }
+    fun syncLineToRaw() { rawText = TextFieldValue(lineItemsToLrc(lineItems)) }
 
-    // ── Derived preview ───────────────────────────────────────────────────────
     val previewDoc = remember(rawText.text, selectedFormat) {
         runCatching { LyricParser.parse(rawText.text, selectedFormat) }.getOrNull()
+    }
+
+    // Phase 6.6: detect out-of-order timestamps in LINE mode
+    val outOfOrderIndices = remember(lineItems) {
+        val result = mutableSetOf<Int>()
+        var lastTs = -1L
+        lineItems.forEachIndexed { idx, item ->
+            val ts = item.timestampMs
+            if (ts != null) {
+                if (ts < lastTs) result.add(idx)
+                lastTs = ts
+            }
+        }
+        result
     }
 
     Scaffold(
@@ -106,8 +123,8 @@ fun LyricEditorScreen(
                         )
                         Text(
                             song.title,
-                            style   = MaterialTheme.typography.bodySmall,
-                            color   = TextMuted,
+                            style    = MaterialTheme.typography.bodySmall,
+                            color    = TextMuted,
                             maxLines = 1
                         )
                     }
@@ -170,11 +187,20 @@ fun LyricEditorScreen(
         bottomBar = {
             Surface(color = Surface1, tonalElevation = 3.dp) {
                 Column(modifier = Modifier.navigationBarsPadding()) {
+                    // ── Phase 6.3: Mini playback bar ──────────────────────────
+                    MiniPlaybackBar(
+                        song              = song,
+                        currentPositionMs = currentPositionMs,
+                        isPlaying         = isPlaying,
+                        onPlayPause       = onPlayPause,
+                        onSeek            = onSeek
+                    )
+
                     // Mode tabs
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 8.dp),
+                            .padding(horizontal = 16.dp, vertical = 4.dp),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         EditorMode.values().forEach { mode ->
@@ -182,14 +208,16 @@ fun LyricEditorScreen(
                             FilterChip(
                                 selected = selected,
                                 onClick  = {
-                                    if (mode == EditorMode.LINE && editorMode == EditorMode.RAW)
+                                    if (mode == EditorMode.LINE && editorMode == EditorMode.RAW) {
                                         syncRawToLine()
+                                        stampCursor = 0
+                                    }
                                     if (mode == EditorMode.RAW && editorMode == EditorMode.LINE)
                                         syncLineToRaw()
                                     editorMode = mode
                                 },
-                                label    = { Text(mode.label) },
-                                colors   = FilterChipDefaults.filterChipColors(
+                                label  = { Text(mode.label) },
+                                colors = FilterChipDefaults.filterChipColors(
                                     selectedContainerColor = AmberDim,
                                     selectedLabelColor     = Amber,
                                     containerColor         = Surface3,
@@ -198,14 +226,25 @@ fun LyricEditorScreen(
                             )
                         }
                         Spacer(Modifier.weight(1f))
-                        // Line count badge
                         val lineCount = previewDoc?.lines?.size ?: 0
                         if (lineCount > 0) {
                             Text(
                                 "$lineCount lines",
-                                style  = MaterialTheme.typography.bodySmall,
-                                color  = TextMuted,
+                                style    = MaterialTheme.typography.bodySmall,
+                                color    = TextMuted,
                                 modifier = Modifier.align(Alignment.CenterVertically)
+                            )
+                        }
+                        // Out-of-order warning badge (Phase 6.6)
+                        if (outOfOrderIndices.isNotEmpty() && editorMode == EditorMode.LINE) {
+                            Spacer(Modifier.width(4.dp))
+                            Icon(
+                                Icons.Filled.Warning,
+                                contentDescription = "${outOfOrderIndices.size} out-of-order timestamps",
+                                tint     = ErrorRed,
+                                modifier = Modifier
+                                    .size(16.dp)
+                                    .align(Alignment.CenterVertically)
                             )
                         }
                     }
@@ -248,13 +287,6 @@ fun LyricEditorScreen(
         }
     ) { padding ->
 
-        // Save result snackbar
-        saveMessage?.let { msg ->
-            LaunchedEffect(msg) {
-                // Caller controls this via a snackbar host if desired
-            }
-        }
-
         Row(
             modifier = Modifier
                 .fillMaxSize()
@@ -262,14 +294,16 @@ fun LyricEditorScreen(
         ) {
             // ── Editor panel ──────────────────────────────────────────────────
             Column(modifier = Modifier.weight(1f)) {
-                // Song info strip
                 SongInfoStrip(song = song)
 
                 // Helper bar (LRC format only)
                 if (selectedFormat == LyricFormat.LRC && editorMode == EditorMode.RAW) {
+                    // Phase 6.5: pass live position so the stamp chip inserts the
+                    // real playback position instead of a static [00:00.00].
                     LrcHelperBar(
+                        currentPositionMs = currentPositionMs,
                         onInsertTimestamp = { ts ->
-                            val cursor = rawText.selection.start
+                            val cursor  = rawText.selection.start
                             val newText = buildString {
                                 append(rawText.text.substring(0, cursor))
                                 append(ts)
@@ -290,14 +324,18 @@ fun LyricEditorScreen(
                         modifier = Modifier.weight(1f)
                     )
                     EditorMode.LINE -> LineEditor(
-                        lines    = lineItems,
-                        onChange = { lineItems = it },
-                        modifier = Modifier.weight(1f)
+                        lines              = lineItems,
+                        stampCursor        = stampCursor,
+                        currentPositionMs  = currentPositionMs,
+                        outOfOrderIndices  = outOfOrderIndices,
+                        onChange           = { lineItems = it },
+                        onStampCursorMoved = { stampCursor = it },
+                        modifier           = Modifier.weight(1f)
                     )
                 }
             }
 
-            // ── Preview panel (side-by-side on wide screens) ──────────────────
+            // ── Preview panel ─────────────────────────────────────────────────
             AnimatedVisibility(
                 visible = showPreview,
                 enter   = slideInHorizontally { it },
@@ -327,9 +365,8 @@ fun LyricEditorScreen(
                             items(previewDoc.lines) { line ->
                                 Column(modifier = Modifier.fillMaxWidth()) {
                                     if (line.timestampMs != null) {
-                                        val ts = line.timestampMs!!
                                         Text(
-                                            formatDuration(ts),
+                                            formatDuration(line.timestampMs!!),
                                             style = MaterialTheme.typography.labelSmall,
                                             color = Amber
                                         )
@@ -348,7 +385,6 @@ fun LyricEditorScreen(
         }
     }
 
-    // ── Discard confirmation ──────────────────────────────────────────────────
     if (showDiscardDialog) {
         AlertDialog(
             onDismissRequest = { showDiscardDialog = false },
@@ -366,6 +402,88 @@ fun LyricEditorScreen(
                     Text("Keep editing", color = Amber)
                 }
             }
+        )
+    }
+}
+
+// ── Phase 6.3 — Mini playback bar ─────────────────────────────────────────────
+
+/**
+ * Compact playback strip embedded in the editor's bottom bar.
+ *
+ * Lets the user play/pause and seek the current song without leaving the
+ * editor — essential for the tap-to-timestamp workflow where you need to
+ * hear the song while stamping lyric lines.
+ *
+ * Intentionally minimal: play/pause button + position label + seek slider.
+ * The full NowPlayingScreen controls (repeat, shuffle, skip) would be noisy
+ * here. The user can navigate back to NowPlayingScreen for those.
+ */
+@Composable
+private fun MiniPlaybackBar(
+    song: Song,
+    currentPositionMs: Long,
+    isPlaying: Boolean,
+    onPlayPause: () -> Unit,
+    onSeek: (Long) -> Unit
+) {
+    val progress = if (song.duration > 0) {
+        currentPositionMs.toFloat() / song.duration
+    } else 0f
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Surface2)
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment     = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        // Play / pause button
+        Box(
+            modifier = Modifier
+                .size(36.dp)
+                .clip(CircleShape)
+                .background(Amber)
+                .clickable(onClick = onPlayPause),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                contentDescription = if (isPlaying) "Pause" else "Play",
+                tint     = Amoled,
+                modifier = Modifier.size(20.dp)
+            )
+        }
+
+        // Position label
+        Text(
+            formatDuration(currentPositionMs),
+            style      = MaterialTheme.typography.bodySmall,
+            color      = TextMuted,
+            fontFamily = FontFamily.Monospace,
+            modifier   = Modifier.width(40.dp)
+        )
+
+        // Seek slider
+        Slider(
+            value         = progress.coerceIn(0f, 1f),
+            onValueChange = { onSeek((it * song.duration).toLong()) },
+            modifier      = Modifier.weight(1f),
+            colors        = SliderDefaults.colors(
+                thumbColor         = Amber,
+                activeTrackColor   = Amber,
+                inactiveTrackColor = Surface3
+            )
+        )
+
+        // Duration label
+        Text(
+            formatDuration(song.duration),
+            style      = MaterialTheme.typography.bodySmall,
+            color      = TextMuted,
+            fontFamily = FontFamily.Monospace,
+            modifier   = Modifier.width(40.dp)
         )
     }
 }
@@ -390,11 +508,10 @@ private fun SongInfoStrip(song: Song) {
                 fontWeight = FontWeight.SemiBold,
                 maxLines   = 1)
             Text("${song.artist} · ${formatDuration(song.duration)}",
-                style   = MaterialTheme.typography.bodySmall,
-                color   = TextMuted,
+                style    = MaterialTheme.typography.bodySmall,
+                color    = TextMuted,
                 maxLines = 1)
         }
-        // Existing lyrics indicator
         if (song.lyricDocument != null) {
             AssistChip(
                 onClick = {},
@@ -415,10 +532,19 @@ private fun SongInfoStrip(song: Song) {
     }
 }
 
-// ── LRC helper bar ────────────────────────────────────────────────────────────
+// ── Phase 6.5 — LRC helper bar with live position ─────────────────────────────
 
+/**
+ * FIX B-7 / Phase 6.5: The "stamp current position" chip now inserts the
+ * live [currentPositionMs] formatted as an LRC timestamp, rather than the
+ * static [00:00.00] placeholder that was there before. The static template
+ * chips for [ti:], [ar:], [al:] are unchanged.
+ */
 @Composable
-private fun LrcHelperBar(onInsertTimestamp: (String) -> Unit) {
+private fun LrcHelperBar(
+    currentPositionMs: Long,
+    onInsertTimestamp: (String) -> Unit
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -431,7 +557,6 @@ private fun LrcHelperBar(onInsertTimestamp: (String) -> Unit) {
             style = MaterialTheme.typography.labelSmall,
             color = TextMuted)
 
-        // Common metadata tags
         listOf(
             "[ti:]" to "Title",
             "[ar:]" to "Artist",
@@ -449,12 +574,18 @@ private fun LrcHelperBar(onInsertTimestamp: (String) -> Unit) {
 
         Spacer(Modifier.weight(1f))
 
-        // Quick timestamp at 00:00.00 — useful as a template
+        // Phase 6.5: live-position stamp chip — inserts the actual playback position.
+        val liveTs = formatLrcTimestamp(currentPositionMs)
         SuggestionChip(
-            onClick = { onInsertTimestamp("[00:00.00]") },
-            label   = { Text("[00:00.00]", style = MaterialTheme.typography.labelSmall,
-                fontFamily = FontFamily.Monospace) },
-            colors  = SuggestionChipDefaults.suggestionChipColors(
+            onClick = { onInsertTimestamp(liveTs) },
+            label   = {
+                Text(
+                    liveTs,
+                    style      = MaterialTheme.typography.labelSmall,
+                    fontFamily = FontFamily.Monospace
+                )
+            },
+            colors = SuggestionChipDefaults.suggestionChipColors(
                 containerColor = AmberDim,
                 labelColor     = Amber
             )
@@ -503,41 +634,103 @@ private fun RawEditor(
     )
 }
 
-// ── Line Editor ───────────────────────────────────────────────────────────────
+// ── Phase 6.4 — Line Editor with stamp-and-advance ───────────────────────────
 
+/**
+ * FIX B-7 / Phase 6.4: Added [stampCursor] and [currentPositionMs] so the
+ * LINE editor can implement real-time tap-to-timestamp:
+ *
+ *  - The row at [stampCursor] is highlighted with an amber left border.
+ *  - Tapping the "Stamp" button at the top writes [currentPositionMs] as that
+ *    row's timestamp, then advances [stampCursor] to the next line.
+ *  - This creates a fast workflow: play the song, tap Stamp at each lyric beat.
+ *
+ * [outOfOrderIndices] — rows whose timestamp precedes the previous row's are
+ * shown with a red timestamp chip (Phase 6.6 warning).
+ */
 @Composable
 private fun LineEditor(
     lines: List<LineItem>,
+    stampCursor: Int,
+    currentPositionMs: Long,
+    outOfOrderIndices: Set<Int>,
     onChange: (List<LineItem>) -> Unit,
+    onStampCursorMoved: (Int) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val listState = rememberLazyListState()
 
+    // Scroll to keep the stamp-cursor row visible
+    LaunchedEffect(stampCursor) {
+        if (stampCursor >= 0 && stampCursor < lines.size) {
+            listState.animateScrollToItem(stampCursor.coerceAtMost(lines.size - 1))
+        }
+    }
+
     Column(modifier = modifier) {
-        // Toolbar: add blank line
+        // Toolbar
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 12.dp, vertical = 4.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment     = Alignment.CenterVertically
         ) {
+            // Add line
             TextButton(
-                onClick = { onChange(lines + LineItem(text = "", timestampMs = null)) },
-                colors  = ButtonDefaults.textButtonColors(contentColor = Amber)
+                onClick = {
+                    onChange(lines + LineItem(text = "", timestampMs = null))
+                },
+                colors = ButtonDefaults.textButtonColors(contentColor = Amber)
             ) {
                 Icon(Icons.Filled.Add, null, modifier = Modifier.size(16.dp))
                 Spacer(Modifier.width(4.dp))
                 Text("Add line", style = MaterialTheme.typography.bodySmall)
             }
+
+            // Clear timestamps
             TextButton(
-                onClick = {
-                    onChange(lines.map { it.copy(timestampMs = null) })
-                },
-                colors = ButtonDefaults.textButtonColors(contentColor = TextMuted)
+                onClick = { onChange(lines.map { it.copy(timestampMs = null) }) },
+                colors  = ButtonDefaults.textButtonColors(contentColor = TextMuted)
             ) {
                 Icon(Icons.Filled.TimerOff, null, modifier = Modifier.size(16.dp))
                 Spacer(Modifier.width(4.dp))
-                Text("Clear timestamps", style = MaterialTheme.typography.bodySmall)
+                Text("Clear all", style = MaterialTheme.typography.bodySmall)
+            }
+
+            Spacer(Modifier.weight(1f))
+
+            // Phase 6.4: Stamp button — stamps current playback position onto
+            // the focused (stampCursor) line and advances to the next.
+            val canStamp = stampCursor < lines.size
+            Button(
+                onClick = {
+                    if (!canStamp) return@Button
+                    val updated = lines.toMutableList().also {
+                        it[stampCursor] = it[stampCursor].copy(timestampMs = currentPositionMs)
+                    }
+                    onChange(updated)
+                    // Auto-advance: move cursor to next unstamped line
+                    val next = (stampCursor + 1).coerceAtMost(lines.size)
+                    onStampCursorMoved(next)
+                },
+                enabled = canStamp,
+                colors  = ButtonDefaults.buttonColors(
+                    containerColor         = Amber,
+                    disabledContainerColor = AmberDim
+                ),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                shape = RoundedCornerShape(8.dp)
+            ) {
+                Icon(Icons.Filled.Timer, null,
+                    modifier = Modifier.size(16.dp), tint = Amoled)
+                Spacer(Modifier.width(4.dp))
+                Text(
+                    "Stamp ${formatLrcTimestamp(currentPositionMs)}",
+                    style      = MaterialTheme.typography.bodySmall,
+                    color      = Amoled,
+                    fontFamily = FontFamily.Monospace
+                )
             }
         }
 
@@ -549,16 +742,23 @@ private fun LineEditor(
         ) {
             itemsIndexed(lines, key = { idx, _ -> idx }) { idx, item ->
                 LineEditorItem(
-                    item      = item,
-                    index     = idx,
-                    onTextChange = { newText ->
+                    item             = item,
+                    index            = idx,
+                    isStampCursor    = idx == stampCursor,
+                    isOutOfOrder     = idx in outOfOrderIndices,
+                    onTextChange     = { newText ->
                         onChange(lines.toMutableList().also { it[idx] = item.copy(text = newText) })
                     },
                     onTimestampChange = { tsMs ->
                         onChange(lines.toMutableList().also { it[idx] = item.copy(timestampMs = tsMs) })
                     },
                     onDelete = {
-                        onChange(lines.toMutableList().also { it.removeAt(idx) })
+                        val newList = lines.toMutableList().also { it.removeAt(idx) }
+                        onChange(newList)
+                        // Keep stampCursor in bounds after deletion
+                        if (idx <= stampCursor) {
+                            onStampCursorMoved((stampCursor - 1).coerceAtLeast(0))
+                        }
                     },
                     onMoveUp = if (idx > 0) ({
                         val mut = lines.toMutableList()
@@ -569,7 +769,8 @@ private fun LineEditor(
                         val mut = lines.toMutableList()
                         val tmp = mut[idx + 1]; mut[idx + 1] = mut[idx]; mut[idx] = tmp
                         onChange(mut)
-                    }) else null
+                    }) else null,
+                    onFocus = { onStampCursorMoved(idx) }
                 )
             }
             item { Spacer(Modifier.height(16.dp)) }
@@ -582,57 +783,81 @@ private fun LineEditor(
 private fun LineEditorItem(
     item: LineItem,
     index: Int,
+    isStampCursor: Boolean,
+    isOutOfOrder: Boolean,
     onTextChange: (String) -> Unit,
     onTimestampChange: (Long?) -> Unit,
     onDelete: () -> Unit,
     onMoveUp: (() -> Unit)?,
-    onMoveDown: (() -> Unit)?
+    onMoveDown: (() -> Unit)?,
+    onFocus: () -> Unit
 ) {
     var showTimestampDialog by remember { mutableStateOf(false) }
+
+    // Phase 6.4: highlight the active stamp-cursor row with an amber left border
+    val borderColor = when {
+        isStampCursor -> Amber
+        isOutOfOrder  -> ErrorRed
+        else          -> Color.Transparent
+    }
 
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(10.dp))
-            .background(Surface2)
+            .background(if (isStampCursor) Surface3 else Surface2)
+            .border(
+                width  = 2.dp,
+                color  = borderColor,
+                shape  = RoundedCornerShape(10.dp)
+            )
             .padding(horizontal = 8.dp, vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically,
+        verticalAlignment     = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp)
     ) {
-        // Line number
         Text(
             "${index + 1}",
             style    = MaterialTheme.typography.labelSmall,
-            color    = TextMuted,
+            color    = if (isStampCursor) Amber else TextMuted,
             modifier = Modifier.width(24.dp)
         )
 
-        // Timestamp chip
-        val tsText = item.timestampMs?.let { formatLrcTimestamp(it) } ?: "--:--.--"
+        // Phase 6.6: timestamp chip turns red when out-of-order
+        val tsText      = item.timestampMs?.let { formatLrcTimestamp(it) } ?: "--:--.--"
+        val tsChipColor = when {
+            isOutOfOrder               -> ErrorRed.copy(alpha = 0.2f)
+            item.timestampMs != null   -> AmberDim
+            else                       -> Surface3
+        }
+        val tsTextColor = when {
+            isOutOfOrder             -> ErrorRed
+            item.timestampMs != null -> Amber
+            else                     -> TextMuted
+        }
+
         SuggestionChip(
-            onClick = { showTimestampDialog = true },
-            label   = {
+            onClick  = { showTimestampDialog = true },
+            label    = {
                 Text(
                     tsText,
                     style      = MaterialTheme.typography.labelSmall,
                     fontFamily = FontFamily.Monospace,
-                    color      = if (item.timestampMs != null) Amber else TextMuted
+                    color      = tsTextColor
                 )
             },
             modifier = Modifier.widthIn(min = 80.dp),
             colors   = SuggestionChipDefaults.suggestionChipColors(
-                containerColor = if (item.timestampMs != null) AmberDim else Surface3
+                containerColor = tsChipColor
             )
         )
 
-        // Lyric text
         BasicLineTextField(
             value    = item.text,
             onChange = onTextChange,
+            onFocus  = onFocus,
             modifier = Modifier.weight(1f)
         )
 
-        // Move up/down
         Column {
             IconButton(
                 onClick  = { onMoveUp?.invoke() },
@@ -654,7 +879,6 @@ private fun LineEditorItem(
             }
         }
 
-        // Delete
         IconButton(onClick = onDelete, modifier = Modifier.size(32.dp)) {
             Icon(Icons.Filled.DeleteOutline, "Delete",
                 tint     = ErrorRed.copy(alpha = 0.7f),
@@ -662,7 +886,6 @@ private fun LineEditorItem(
         }
     }
 
-    // ── Timestamp editor dialog ───────────────────────────────────────────────
     if (showTimestampDialog) {
         TimestampDialog(
             currentMs  = item.timestampMs,
@@ -677,6 +900,7 @@ private fun LineEditorItem(
 private fun BasicLineTextField(
     value: String,
     onChange: (String) -> Unit,
+    onFocus: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     OutlinedTextField(
@@ -693,7 +917,19 @@ private fun BasicLineTextField(
             cursorColor             = Amber
         ),
         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
-        shape = RoundedCornerShape(8.dp)
+        shape = RoundedCornerShape(8.dp),
+        // Move the stampCursor to this row when the field gains focus so the
+        // Stamp button always targets the line the user is actively editing.
+        interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+            .also { source ->
+                LaunchedEffect(source) {
+                    source.interactions.collect { interaction ->
+                        if (interaction is androidx.compose.foundation.interaction.FocusInteraction.Focus) {
+                            onFocus()
+                        }
+                    }
+                }
+            }
     )
 }
 
@@ -744,10 +980,9 @@ private fun TimestampDialog(
                         modifier = Modifier.weight(1.5f)
                     )
                 }
-                // Computed preview
                 val previewMs = ((minutes.toLongOrNull() ?: 0L) * 60_000L) +
-                                ((seconds.toLongOrNull() ?: 0L) * 1_000L) +
-                                 (millis.toLongOrNull()  ?: 0L)
+                        ((seconds.toLongOrNull() ?: 0L) * 1_000L) +
+                        (millis.toLongOrNull()  ?: 0L)
                 Text(
                     "→ ${formatLrcTimestamp(previewMs)}",
                     style      = MaterialTheme.typography.bodySmall,
@@ -759,8 +994,8 @@ private fun TimestampDialog(
         confirmButton = {
             TextButton(onClick = {
                 val ms = ((minutes.toLongOrNull() ?: 0L) * 60_000L) +
-                         ((seconds.toLongOrNull() ?: 0L) * 1_000L) +
-                          (millis.toLongOrNull()  ?: 0L)
+                        ((seconds.toLongOrNull() ?: 0L) * 1_000L) +
+                        (millis.toLongOrNull()  ?: 0L)
                 onConfirm(ms)
             }) { Text("Set", color = Amber) }
         },
@@ -816,7 +1051,6 @@ data class LineItem(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/** Parse raw LRC/plain text into [LineItem] list for the line editor. */
 private fun parseToLineItems(raw: String): List<LineItem> {
     if (raw.isBlank()) return listOf(LineItem("", null))
     return runCatching {
@@ -831,13 +1065,10 @@ private fun parseToLineItems(raw: String): List<LineItem> {
     }
 }
 
-/** Convert [LineItem] list back to LRC text. */
 private fun lineItemsToLrc(items: List<LineItem>): String = buildString {
     for (item in items) {
         val ts = item.timestampMs
-        if (ts != null) {
-            append(formatLrcTimestamp(ts))
-        }
+        if (ts != null) append(formatLrcTimestamp(ts))
         appendLine(item.text)
     }
 }
@@ -848,3 +1079,16 @@ fun formatLrcTimestamp(ms: Long): String {
     val secs = (ms % 60_000) / 1000.0
     return "[%02d:%05.2f]".format(mins, secs)
 }
+
+// LyricDocument.toLrcText() is defined in LyricExtensions.kt
+private fun com.enigma.devlyric.core.LyricDocument.toLrcText(): String = buildString {
+    for (line in lines) {
+        val ts = line.timestampMs
+        if (ts != null) {
+            val mins = ts / 60_000L
+            val secs = (ts % 60_000L) / 1000.0
+            append("[%02d:%05.2f]".format(mins, secs))
+        }
+        appendLine(line.text)
+    }
+}.trimEnd()

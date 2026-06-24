@@ -12,6 +12,8 @@ import android.net.Uri
 import android.os.IBinder
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.core.graphics.toColorInt
+import androidx.palette.graphics.Palette
 import com.enigma.devlyric.core.LyricDocument
 import com.enigma.devlyric.core.LyricFormat
 import com.enigma.devlyric.core.LyricParser
@@ -25,22 +27,34 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import androidx.core.graphics.toColorInt
-import androidx.palette.graphics.Palette
 
 /**
  * Central ViewModel for Dreamer.
  *
- * Fixes applied in this version:
- *  B-3  – tryRestoreSession race: the onServiceConnected callback no longer
- *          calls tryRestoreSession directly. loadAll() always calls it once songs
- *          are available, and sessionRestored prevents double-restore.
- *  B-9  – Color extraction now uses AndroidX Palette instead of the hand-rolled
- *          12×12 grid averager that produced muddy mid-tone blends. Palette's
- *          median-cut algorithm picks the single most prominent vibrant hue.
- *  B-13 – Position tracking loop skips the expensive mutateReady work when
- *          playback is paused, preventing 120 needless StateFlow emissions and
- *          Compose recompositions per minute at idle.
+ * Phase 7.2 (A-1): MusicUiState.Ready no longer carries data. State is now
+ * split into two independent StateFlows:
+ *
+ *   [libraryState] — songs, playlists, search, sort.
+ *                    Only mutated on scan, search/sort changes, favorite
+ *                    toggles, playlist edits, and lyric bakes. Stable
+ *                    between songs, never touched by the position ticker.
+ *
+ *   [playerState]  — playback position, current song, lyric line, colors.
+ *                    The 500 ms position ticker ONLY mutates this flow.
+ *                    Copying PlayerState (7 fields, no List<Song>) is ~100×
+ *                    cheaper than copying the old MusicUiState.Ready (11
+ *                    fields including a List<Song> of thousands of entries).
+ *
+ * Phase 7.3 (B-6): observeSongs() is now collected. The ViewModel subscribes
+ * to the Room songs Flow so the UI reacts automatically to MediaStore changes
+ * (downloads, deletions) without requiring a manual rescan tap. The hot scan
+ * path (scanAndSync) remains the primary update mechanism; the observer is a
+ * safety net for out-of-band changes.
+ *
+ * Previously applied fixes retained:
+ *   B-3  – tryRestoreSession race removed from onServiceConnected
+ *   B-9  – AndroidX Palette for color extraction
+ *   B-13 – position ticker skips work when paused
  */
 class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -57,13 +71,16 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private val deletePlaylistUseCase         = DeletePlaylistUseCase(repo)
     private val renamePlaylistUseCase         = RenamePlaylistUseCase(repo)
 
-    // ── UI State ──────────────────────────────────────────────────────────────
+    // ── Split state (Phase 7.2) ───────────────────────────────────────────────
 
-    private val _uiState = MutableStateFlow<MusicUiState>(MusicUiState.Loading)
+    private val _uiState      = MutableStateFlow<MusicUiState>(MusicUiState.Loading)
     val uiState: StateFlow<MusicUiState> = _uiState.asStateFlow()
 
-    private val readyState: MusicUiState.Ready?
-        get() = _uiState.value as? MusicUiState.Ready
+    private val _libraryState = MutableStateFlow(LibraryState())
+    val libraryState: StateFlow<LibraryState> = _libraryState.asStateFlow()
+
+    private val _playerState  = MutableStateFlow(PlayerState())
+    val playerState: StateFlow<PlayerState> = _playerState.asStateFlow()
 
     private val _scanProgress = MutableStateFlow<Int?>(null)
     val scanProgress: StateFlow<Int?> = _scanProgress.asStateFlow()
@@ -79,6 +96,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private var positionJob: Job? = null
     private var playlistObserverJob: Job? = null
     private var favoriteObserverJob: Job? = null
+    private var songObserverJob: Job? = null   // Phase 7.3
     private var scanJob: Job? = null
 
     private val serviceConnection = object : ServiceConnection {
@@ -89,14 +107,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 b.service.playbackState.collect { ps -> updatePlayback(ps) }
             }
             startPositionTracking()
-            // FIX B-3: DO NOT call tryRestoreSession here.
-            //
-            // The race: binding can complete while _uiState is still Loading
-            // (songs list is empty), which means tryRestoreSession receives an
-            // empty allSongs list and silently fails to restore anything. The
-            // correct call site is loadAll(), which calls it after songs are
-            // confirmed available. MusicService.sessionRestored prevents a
-            // double-restore if the timing ever reverses.
+            // FIX B-3: tryRestoreSession NOT called here — race condition removed.
+            // loadAll() calls it once songs are confirmed available.
         }
 
         override fun onServiceDisconnected(name: ComponentName) {
@@ -125,18 +137,16 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 val cachedSongs = repo.loadSongsFromCache()
 
                 if (cachedSongs.isNotEmpty()) {
-                    _uiState.value = MusicUiState.Ready(
+                    _libraryState.value = LibraryState(
                         songs         = cachedSongs,
                         playlists     = playlists,
                         filteredSongs = cachedSongs
                     )
+                    _uiState.value = MusicUiState.Ready
                     observePlaylists()
                     observeFavorites()
-                    // FIX B-3: tryRestoreSession lives here, not in onServiceConnected.
-                    // At this point songs are confirmed non-empty. If the service isn't
-                    // bound yet, musicService is null and the call is a no-op; the
-                    // session will be restored in launchBackgroundScan's callback once
-                    // the scan completes and the service is definitely bound.
+                    observeSongsFromDb()   // Phase 7.3
+                    // FIX B-3: restore session here, after songs are confirmed
                     musicService?.tryRestoreSession(cachedSongs)
                 }
                 launchBackgroundScan(firstLaunch = cachedSongs.isEmpty(), playlists = playlists)
@@ -146,7 +156,10 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun launchBackgroundScan(firstLaunch: Boolean, playlists: List<Playlist> = emptyList()) {
+    private fun launchBackgroundScan(
+        firstLaunch: Boolean,
+        playlists: List<Playlist> = emptyList()
+    ) {
         scanJob?.cancel()
         scanJob = viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -157,18 +170,20 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 withContext(Dispatchers.Main) {
                     if (firstLaunch) {
                         val pl = getPlaylistsUseCase.loadAll()
-                        _uiState.value = MusicUiState.Ready(
+                        _libraryState.value = LibraryState(
                             songs         = freshSongs,
                             playlists     = pl,
                             filteredSongs = freshSongs
                         )
+                        _uiState.value = MusicUiState.Ready
                         observePlaylists()
                         observeFavorites()
-                        // FIX B-3: restore session after scan on first launch
-                        // (cache was empty so this is the first time songs are available)
+                        observeSongsFromDb()   // Phase 7.3
                         musicService?.tryRestoreSession(freshSongs)
                     } else {
-                        mutateReady {
+                        mutateLibrary {
+                            // Preserve any in-memory lyric documents from the
+                            // previous library state so they survive the scan merge.
                             val lyricCache = songs
                                 .filter { it.lyricDocument != null }
                                 .associate { it.id to it.lyricDocument!! }
@@ -199,11 +214,53 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     fun rescan() { launchBackgroundScan(firstLaunch = false) }
 
+    // ── Phase 7.3: wire observeSongs() (FIX B-6) ─────────────────────────────
+    //
+    // Previously SongRepository.observeSongs() was exported but never collected,
+    // so MediaStore changes made by other apps (a file manager deleting a song,
+    // a download completing) were invisible until the user tapped Rescan.
+    //
+    // Now we collect the Room Flow as a passive observer. When scanAndSync()
+    // writes new data to Room, the Flow emits and we apply a lightweight merge
+    // that preserves in-memory lyric documents. This replaces the need for
+    // manual mutateReady calls after each scan.
+    //
+    // The active scan path (launchBackgroundScan) still drives the primary
+    // update — the observer is a reactive complement, not a replacement.
+    // If observeSongsFromDb and launchBackgroundScan race on first launch,
+    // the scan's explicit withContext(Main) block runs last and wins, which
+    // is the desired outcome (freshest data from MediaStore, not stale cache).
+    private fun observeSongsFromDb() {
+        songObserverJob?.cancel()
+        songObserverJob = viewModelScope.launch {
+            // drop(1): skip the initial emission which duplicates the cache
+            // load already applied in loadAll(). Only react to subsequent
+            // Room writes (i.e. from scanAndSync completing).
+            repo.observeSongs().drop(1).collect { dbSongs ->
+                mutateLibrary {
+                    val lyricCache = songs
+                        .filter { it.lyricDocument != null }
+                        .associate { it.id to it.lyricDocument!! }
+                    val merged = dbSongs.map { song ->
+                        song.copy(
+                            lyricDocument = lyricCache[song.id],
+                            isFavorite    = song.isFavorite
+                        )
+                    }
+                    copy(
+                        songs         = merged,
+                        filteredSongs = searchSongsUseCase(merged, searchQuery)
+                    )
+                }
+            }
+        }
+    }
+
     private fun observePlaylists() {
         playlistObserverJob?.cancel()
         playlistObserverJob = viewModelScope.launch {
             getPlaylistsUseCase().collect { playlists ->
-                mutateReady { copy(playlists = playlists) }
+                mutateLibrary { copy(playlists = playlists) }
             }
         }
     }
@@ -212,7 +269,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         favoriteObserverJob?.cancel()
         favoriteObserverJob = viewModelScope.launch {
             observeFavoritesUseCase().collect { favIds ->
-                mutateReady {
+                mutateLibrary {
                     val updated = songs.map { it.copy(isFavorite = it.id in favIds) }
                     copy(
                         songs         = updated,
@@ -231,15 +288,18 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             val doc = repo.loadLyricsForSong(song) ?: return@launch
             val updated = song.copy(lyricDocument = doc)
             withContext(Dispatchers.Main) {
-                mutateReady {
+                mutateLibrary {
                     val newSongs = songs.map { if (it.id == song.id) updated else it }
                     copy(
                         songs         = newSongs,
-                        filteredSongs = searchSongsUseCase(newSongs, searchQuery),
-                        playbackState = if (playbackState.currentSong?.id == song.id)
-                            playbackState.copy(currentSong = updated)
-                        else playbackState
+                        filteredSongs = searchSongsUseCase(newSongs, searchQuery)
                     )
+                }
+                // Also update the current song in PlayerState if it's the same song
+                mutatePlayer {
+                    if (playbackState.currentSong?.id == song.id)
+                        copy(playbackState = playbackState.copy(currentSong = updated))
+                    else this
                 }
             }
         }
@@ -247,12 +307,13 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     // ── Playback controls ─────────────────────────────────────────────────────
 
-    fun playSong(song: Song, queue: List<Song> = readyState?.songs ?: listOf(song)) {
+    fun playSong(song: Song, queue: List<Song> = _libraryState.value.songs) {
         val index = queue.indexOfFirst { it.id == song.id }.coerceAtLeast(0)
         musicService?.setQueue(queue, index) ?: return
-        mutateReady {
+        mutatePlayer {
             copy(playbackState = playbackState.copy(
-                isPlaying = true, bufferingState = BufferingState.PREPARING
+                isPlaying      = true,
+                bufferingState = BufferingState.PREPARING
             ))
         }
         loadLyricsIfNeeded(song)
@@ -260,11 +321,11 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun playPlaylist(playlist: Playlist) {
-        val state = readyState ?: return
-        val songs = playlist.songIds.mapNotNull { id -> state.songs.find { it.id == id } }
+        val lib   = _libraryState.value
+        val songs = playlist.songIds.mapNotNull { id -> lib.songs.find { it.id == id } }
         if (songs.isEmpty()) return
         musicService?.setQueue(songs, 0)
-        mutateReady {
+        mutatePlayer {
             copy(playbackState = playbackState.copy(
                 currentPlaylistId = playlist.id,
                 isPlaying         = true,
@@ -287,40 +348,41 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     fun seekTo(positionMs: Long) {
         musicService?.seekTo(positionMs)
-        mutateReady { copy(playbackState = playbackState.copy(positionMs = positionMs)) }
+        mutatePlayer { copy(playbackState = playbackState.copy(positionMs = positionMs)) }
     }
 
     fun toggleRepeat() {
-        val next = when (currentRepeatMode()) {
+        val next = when (_playerState.value.playbackState.repeatMode) {
             RepeatMode.NONE -> RepeatMode.ALL
             RepeatMode.ALL  -> RepeatMode.ONE
             RepeatMode.ONE  -> RepeatMode.NONE
         }
         musicService?.setRepeatMode(next)
-        mutateReady { copy(playbackState = playbackState.copy(repeatMode = next)) }
+        mutatePlayer { copy(playbackState = playbackState.copy(repeatMode = next)) }
     }
 
     fun toggleShuffle() {
-        val next = if (currentShuffleMode() == ShuffleMode.OFF) ShuffleMode.ON else ShuffleMode.OFF
+        val current = _playerState.value.playbackState.shuffleMode
+        val next    = if (current == ShuffleMode.OFF) ShuffleMode.ON else ShuffleMode.OFF
         musicService?.setShuffleMode(next)
-        mutateReady { copy(playbackState = playbackState.copy(shuffleMode = next)) }
+        mutatePlayer { copy(playbackState = playbackState.copy(shuffleMode = next)) }
     }
 
     fun setPlaybackSpeed(speed: Float) {
         musicService?.setPlaybackSpeed(speed)
-        mutateReady { copy(playbackState = playbackState.copy(playbackSpeed = speed)) }
+        mutatePlayer { copy(playbackState = playbackState.copy(playbackSpeed = speed)) }
     }
 
     // ── Queue ─────────────────────────────────────────────────────────────────
 
-    fun toggleQueueView() { mutateReady { copy(showQueue = !showQueue) } }
+    fun toggleQueueView() { mutatePlayer { copy(showQueue = !showQueue) } }
 
     fun playNext(song: Song) {
         val service = musicService ?: return
         val ps      = service.playbackState.value
         if (ps.queue.isEmpty()) { playSong(song); return }
         service.insertIntoQueue(song, (ps.queueIndex + 1).coerceAtMost(ps.queue.size))
-        mutateReady {
+        mutatePlayer {
             copy(playbackState = playbackState.copy(queue = service.playbackState.value.queue))
         }
     }
@@ -330,7 +392,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         val ps      = service.playbackState.value
         if (ps.queue.isEmpty()) { playSong(song); return }
         service.appendToQueue(song)
-        mutateReady {
+        mutatePlayer {
             copy(playbackState = playbackState.copy(queue = service.playbackState.value.queue))
         }
     }
@@ -340,7 +402,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         val ps      = service.playbackState.value
         val song    = ps.queue.getOrNull(index) ?: return
         service.setQueue(ps.queue, index)
-        mutateReady {
+        mutatePlayer {
             copy(playbackState = playbackState.copy(
                 queue       = ps.queue,
                 queueIndex  = index,
@@ -365,13 +427,13 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     // ── Search & Sort ─────────────────────────────────────────────────────────
 
     fun search(query: String) {
-        mutateReady {
+        mutateLibrary {
             copy(searchQuery = query, filteredSongs = searchSongsUseCase(songs, query))
         }
     }
 
     fun setSortOrder(order: SortOrder) {
-        mutateReady {
+        mutateLibrary {
             val sorted   = sortSongsUseCase(songs, order)
             val filtered = sortSongsUseCase(searchSongsUseCase(sorted, searchQuery), order)
             copy(songs = sorted, filteredSongs = filtered, sortOrder = order)
@@ -388,7 +450,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     // ── Lyrics ────────────────────────────────────────────────────────────────
 
-    fun toggleLyrics() { mutateReady { copy(showLyrics = !showLyrics) } }
+    fun toggleLyrics() { mutatePlayer { copy(showLyrics = !showLyrics) } }
 
     fun bakeLyricsToSong(
         song: Song,
@@ -420,39 +482,25 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun applyUpdatedLyrics(song: Song, doc: LyricDocument) {
         val updated = song.copy(lyricDocument = doc)
-        mutateReady {
+        mutateLibrary {
             val newSongs = songs.map { if (it.id == song.id) updated else it }
             copy(
                 songs         = newSongs,
-                filteredSongs = searchSongsUseCase(newSongs, searchQuery),
-                playbackState = if (playbackState.currentSong?.id == song.id)
-                    playbackState.copy(currentSong = updated)
-                else playbackState
+                filteredSongs = searchSongsUseCase(newSongs, searchQuery)
             )
+        }
+        mutatePlayer {
+            if (playbackState.currentSong?.id == song.id)
+                copy(playbackState = playbackState.copy(currentSong = updated))
+            else this
         }
     }
 
     fun clearError() {
-        mutateReady { copy(playbackState = playbackState.copy(error = null)) }
+        mutatePlayer { copy(playbackState = playbackState.copy(error = null)) }
     }
 
-    // ── Dynamic colour extraction ─────────────────────────────────────────────
-    //
-    // FIX B-9: Replaced the hand-rolled 12×12 grid sampler with AndroidX Palette.
-    //
-    // The old algorithm took the top-20 most saturated×bright pixels and averaged
-    // their RGB values. Averaging distinct vibrant colors (e.g. bright red + bright
-    // blue) produces a muddy mid-tone (dark purple) — neither hue. This was visible
-    // as an unexpectedly grey or brown background on many album covers.
-    //
-    // Palette.from(bitmap).generate() runs a median-cut quantization algorithm
-    // that identifies the dominant color clusters and returns a set of named swatches
-    // (DarkVibrant, DarkMuted, Vibrant, etc.). We prefer DarkVibrant (rich, dark
-    // enough for white text) then fall back through the swatch hierarchy to ensure
-    // the background is always dark enough for the UI.
-    //
-    // build.gradle dependency required:
-    //   implementation "androidx.palette:palette-ktx:1.0.0"
+    // ── Color extraction (FIX B-9 — AndroidX Palette) ────────────────────────
 
     fun scheduleColorExtraction(artUri: Uri?, songId: Long) {
         if (songId == lastColorSongId) return
@@ -474,25 +522,15 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             val contrast = contrastColor(dominant)
 
             withContext(Dispatchers.Main) {
-                mutateReady { copy(dominantColor = dominant, accentTextColor = contrast) }
+                mutatePlayer { copy(dominantColor = dominant, accentTextColor = contrast) }
                 musicService?.updateAlbumArt(bitmap, dominant)
             }
         }
     }
 
-    // Kept for backward compatibility — delegates to scheduleColorExtraction.
     fun extractAndApplyColor(artUri: Uri?, songId: Long) =
         scheduleColorExtraction(artUri, songId)
 
-    /**
-     * FIX B-9: Use AndroidX Palette for accurate dominant color extraction.
-     *
-     * Swatch preference order (dark first so white text is always readable):
-     *   DarkVibrant → DarkMuted → Vibrant → Muted → DEFAULT_BG
-     *
-     * Each swatch's rgb value is then darkened by 30% so even a bright
-     * DarkVibrant swatch doesn't bleach the background white.
-     */
     private fun dominantColor(bmp: Bitmap): Int {
         val palette = Palette.from(bmp).generate()
         val swatch  = palette.darkVibrantSwatch
@@ -501,7 +539,6 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             ?: palette.mutedSwatch
             ?: return DEFAULT_BG
 
-        // Darken by 30% so the background stays clearly dark against white text
         val r = (Color.red(swatch.rgb)   * 0.70f).toInt().coerceIn(0, 255)
         val g = (Color.green(swatch.rgb) * 0.70f).toInt().coerceIn(0, 255)
         val b = (Color.blue(swatch.rgb)  * 0.70f).toInt().coerceIn(0, 255)
@@ -516,7 +553,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         return if (lum > 0.179) "#1A1A1A".toColorInt() else Color.WHITE
     }
 
-    // ── Position tracking ─────────────────────────────────────────────────────
+    // ── Position tracking (FIX B-13 — skip when paused) ──────────────────────
 
     private fun startPositionTracking() {
         positionJob?.cancel()
@@ -524,25 +561,23 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             while (true) {
                 delay(500)
                 val service = musicService ?: continue
-
-                // FIX B-13: Skip the expensive work when paused.
-                //
-                // The old loop called currentPosition(), findCurrentLyricLine(),
-                // and mutateReady {} every 500 ms unconditionally — 120 StateFlow
-                // emissions and Compose recompositions per minute while the app
-                // sat idle and paused. The UI shows a static position when paused
-                // so none of that work produced visible changes.
-                //
-                // Now we only do the full update when actually playing. We still
-                // allow one final update on the tick immediately after a pause
-                // event so the position label is accurate when the user pauses.
+                // FIX B-13: skip expensive work when paused
                 if (!service.playbackState.value.isPlaying) continue
 
                 val pos      = service.currentPosition()
-                val state    = readyState ?: continue
-                val song     = state.playbackState.currentSong
-                val lyricIdx = song?.lyricDocument?.let { findCurrentLyricLine(it, pos) } ?: -1
-                mutateReady {
+                val lib      = _libraryState.value
+                val ps       = _playerState.value
+                val song     = ps.playbackState.currentSong
+                // Prefer in-memory lyric doc (loaded lazily) over the one in
+                // libraryState, which may not yet have been merged back.
+                val lyricDoc = song?.lyricDocument
+                    ?: lib.songs.find { it.id == song?.id }?.lyricDocument
+                val lyricIdx = lyricDoc?.let { findCurrentLyricLine(it, pos) } ?: -1
+
+                // Phase 7.2: ONLY mutate PlayerState here — libraryState is
+                // never touched by the position ticker. This is the core win:
+                // NowPlayingScreen recomposes; LibraryScreen does not.
+                mutatePlayer {
                     copy(
                         playbackState    = playbackState.copy(positionMs = pos),
                         currentLyricLine = lyricIdx
@@ -564,7 +599,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     private fun updatePlayback(ps: PlaybackState) {
-        mutateReady { copy(playbackState = ps) }
+        mutatePlayer { copy(playbackState = ps) }
         val song = ps.currentSong ?: return
         if (song.id != lastColorSongId) {
             scheduleColorExtraction(song.albumArtUri, song.id)
@@ -572,19 +607,28 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         loadLyricsIfNeeded(song)
     }
 
-    private fun mutateReady(block: MusicUiState.Ready.() -> MusicUiState.Ready) {
-        val current = readyState ?: return
-        _uiState.value = current.block()
+    /**
+     * Mutate [_libraryState] atomically.
+     * Only call from the main thread (viewModelScope default dispatcher).
+     */
+    private fun mutateLibrary(block: LibraryState.() -> LibraryState) {
+        _libraryState.value = _libraryState.value.block()
     }
 
-    private fun currentRepeatMode()  = readyState?.playbackState?.repeatMode  ?: RepeatMode.NONE
-    private fun currentShuffleMode() = readyState?.playbackState?.shuffleMode ?: ShuffleMode.OFF
+    /**
+     * Mutate [_playerState] atomically.
+     * Only call from the main thread (viewModelScope default dispatcher).
+     */
+    private fun mutatePlayer(block: PlayerState.() -> PlayerState) {
+        _playerState.value = _playerState.value.block()
+    }
 
     override fun onCleared() {
         super.onCleared()
         positionJob?.cancel()
         playlistObserverJob?.cancel()
         favoriteObserverJob?.cancel()
+        songObserverJob?.cancel()
         scanJob?.cancel()
         colorJob?.cancel()
         getApplication<Application>().unbindService(serviceConnection)

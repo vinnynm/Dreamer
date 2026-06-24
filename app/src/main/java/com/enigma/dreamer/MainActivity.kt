@@ -24,10 +24,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.toRoute
-import com.enigma.devlyric.core.LyricFormat
-import com.enigma.dreamer.core.MusicUiState
-import com.enigma.dreamer.core.Playlist
-import com.enigma.dreamer.core.Song
+import com.enigma.dreamer.core.*
 import kotlinx.serialization.Serializable
 import com.enigma.dreamer.ui.screens.LibraryScreen
 import com.enigma.dreamer.ui.screens.LyricEditorScreen
@@ -70,6 +67,9 @@ class MainActivity : ComponentActivity() {
             } else {
                 add(Manifest.permission.READ_EXTERNAL_STORAGE)
             }
+            if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
+                add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            }
             add(Manifest.permission.FOREGROUND_SERVICE)
             add(Manifest.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK)
         }
@@ -87,30 +87,39 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun DevLyricApp(viewModel: MusicViewModel, openNowPlaying: Boolean = false) {
-    val uiState       by viewModel.uiState.collectAsState()
+    // Phase 7.2: collect the two state flows independently.
+    //
+    // Previously a single collectAsState() on MusicUiState.Ready drove the
+    // entire composition. Now:
+    //   • uiState    — loading/error envelope only; drives the top-level when{} branch
+    //   • libState   — songs, playlists, search/sort; stable between songs
+    //   • playerState — position, current song, colors; updated every 500 ms while playing
+    //
+    // Screens that only read libState (e.g. the Playlists tab, search bar) are
+    // never recomposed by the 500 ms position ticker. NowPlayingScreen reads
+    // playerState and is the only screen that recomposes at playback frequency.
+    val uiState     by viewModel.uiState.collectAsState()
+    val libState    by viewModel.libraryState.collectAsState()
+    val playerState by viewModel.playerState.collectAsState()
+
     val navController = rememberNavController()
 
     LaunchedEffect(openNowPlaying) {
         if (openNowPlaying) navController.navigate(NowPlayingRoute) { launchSingleTop = true }
     }
 
-    // ── Derive dynamic theme colors from album art ────────────────────────────
-    // Extract colors at this level so DreamerTheme can receive them and propagate
-    // via LocalDynamicColors to the entire composition tree.
-    val (dominantColor, accentTextColor) = when (val state = uiState) {
-        is MusicUiState.Ready -> Color(state.dominantColor) to Color(state.accentTextColor)
-        else                  -> Surface1 to TextPrimary
-    }
+    val dominantColor   = Color(playerState.dominantColor)
+    val accentTextColor = Color(playerState.accentTextColor)
 
     DreamerTheme(
         dominantColor   = dominantColor,
         accentTextColor = accentTextColor
     ) {
-        when (val state = uiState) {
+        when (uiState) {
             is MusicUiState.Loading -> LoadingScreen()
-            is MusicUiState.Error   -> ErrorScreen(state.message) { }
+            is MusicUiState.Error   -> ErrorScreen((uiState as MusicUiState.Error).message) { }
             is MusicUiState.Ready   -> {
-                val ps                = state.playbackState
+                val ps                = playerState.playbackState
                 val snackbarHostState = remember { SnackbarHostState() }
 
                 LaunchedEffect(ps.error) {
@@ -126,35 +135,27 @@ fun DevLyricApp(viewModel: MusicViewModel, openNowPlaying: Boolean = false) {
                     ) {
 
                         composable<LibraryRoute> {
-                            val songs           = state.songs
-                            val filteredSongs   = state.filteredSongs
-                            val playlists       = state.playlists
-                            val currentSong     = ps.currentSong
-                            val isPlaying       = ps.isPlaying
-                            val progress        = ps.progress
-
-                            // NEW: collect scan progress for the progress bar in LibraryScreen
                             val scanProgress by viewModel.scanProgress.collectAsState()
 
-                            val onSongClickRem = remember(viewModel, filteredSongs) {
+                            val onSongClickRem = remember(viewModel, libState.filteredSongs) {
                                 { song: Song ->
-                                    viewModel.playSong(song, filteredSongs)
+                                    viewModel.playSong(song, libState.filteredSongs)
                                     navController.navigate(NowPlayingRoute)
                                 }
                             }
-                            val onPlaylistClickRem = remember {
+                            val onPlaylistClickRem  = remember {
                                 { pl: Playlist -> navController.navigate(PlaylistDetailRoute(pl.id)) }
                             }
                             val onToggleFavoriteRem = remember { viewModel::toggleFavorite }
-                            val onEditLyricsRem = remember {
+                            val onEditLyricsRem     = remember {
                                 { song: Song -> navController.navigate(LyricEditorRoute(song.id)) }
                             }
                             val onMiniPlayerClickRem = remember {
                                 { navController.navigate(NowPlayingRoute) }
                             }
-                            val onPlayFavoritesRem = remember(viewModel, songs) {
+                            val onPlayFavoritesRem = remember(viewModel, libState.songs) {
                                 {
-                                    val favs = songs.filter { it.isFavorite }
+                                    val favs = libState.songs.filter { it.isFavorite }
                                     if (favs.isNotEmpty()) {
                                         viewModel.playSong(favs.first(), favs)
                                         navController.navigate(NowPlayingRoute)
@@ -163,15 +164,16 @@ fun DevLyricApp(viewModel: MusicViewModel, openNowPlaying: Boolean = false) {
                             }
 
                             LibraryScreen(
-                                songs               = songs,
-                                filteredSongs       = filteredSongs,
-                                playlists           = playlists,
-                                searchQuery         = state.searchQuery,
-                                sortOrder           = state.sortOrder,
-                                currentSong         = currentSong,
-                                isPlaying           = isPlaying,
-                                playbackProgress    = progress,
-                                scanProgress        = scanProgress,          // NEW
+                                songs               = libState.songs,
+                                filteredSongs       = libState.filteredSongs,
+                                playlists           = libState.playlists,
+                                searchQuery         = libState.searchQuery,
+                                sortOrder           = libState.sortOrder,
+                                currentSong         = ps.currentSong,
+                                isPlaying           = ps.isPlaying,
+                                playbackProgress    = ps.progress,
+                                dominantColor       = playerState.dominantColor,
+                                scanProgress        = scanProgress,
                                 onSongClick         = onSongClickRem,
                                 onPlaylistClick     = onPlaylistClickRem,
                                 onSearch            = viewModel::search,
@@ -188,18 +190,22 @@ fun DevLyricApp(viewModel: MusicViewModel, openNowPlaying: Boolean = false) {
                                 onMiniPlayerClick   = onMiniPlayerClickRem,
                                 onMiniPlayPause     = viewModel::togglePlayPause,
                                 onMiniNext          = viewModel::next,
-                                onRescan            = viewModel::rescan       // NEW
+                                onMiniPrevious      = viewModel::previous,
+                                onRescan            = viewModel::rescan
                             )
                         }
 
                         composable<NowPlayingRoute> {
+                            // NowPlayingScreen reads from playerState exclusively —
+                            // it is the only screen that recomposes at 500 ms frequency.
+                            // libState changes (search, favorites) do NOT reach here.
                             NowPlayingScreen(
                                 playbackState      = ps,
-                                currentLyricLine   = state.currentLyricLine,
-                                showLyrics         = state.showLyrics,
-                                showQueue          = state.showQueue,
-                                dominantColor      = state.dominantColor,
-                                accentTextColor    = state.accentTextColor,
+                                currentLyricLine   = playerState.currentLyricLine,
+                                showLyrics         = playerState.showLyrics,
+                                showQueue          = playerState.showQueue,
+                                dominantColor      = playerState.dominantColor,
+                                accentTextColor    = playerState.accentTextColor,
                                 onPlayPause        = viewModel::togglePlayPause,
                                 onNext             = viewModel::next,
                                 onPrevious         = viewModel::previous,
@@ -221,7 +227,7 @@ fun DevLyricApp(viewModel: MusicViewModel, openNowPlaying: Boolean = false) {
                         composable<SettingsRoute> {
                             SettingsScreen(
                                 playbackSpeed      = ps.playbackSpeed,
-                                sortOrder          = state.sortOrder,
+                                sortOrder          = libState.sortOrder,
                                 sleepTimer         = ps.sleepTimer,
                                 onSpeedChange      = viewModel::setPlaybackSpeed,
                                 onSortChange       = viewModel::setSortOrder,
@@ -233,10 +239,10 @@ fun DevLyricApp(viewModel: MusicViewModel, openNowPlaying: Boolean = false) {
 
                         composable<PlaylistDetailRoute> { entry ->
                             val route    = entry.toRoute<PlaylistDetailRoute>()
-                            val playlist = state.playlists.find { it.id == route.playlistId }
+                            val playlist = libState.playlists.find { it.id == route.playlistId }
                             if (playlist != null) {
                                 val songs = playlist.songIds.mapNotNull { id ->
-                                    state.songs.find { it.id == id }
+                                    libState.songs.find { it.id == id }
                                 }
                                 PlaylistDetailScreen(
                                     playlist    = playlist,
@@ -263,7 +269,10 @@ fun DevLyricApp(viewModel: MusicViewModel, openNowPlaying: Boolean = false) {
 
                         composable<LyricEditorRoute> { entry ->
                             val route = entry.toRoute<LyricEditorRoute>()
-                            val song  = state.songs.find { it.id == route.songId }
+                            // Read from libState (stable) — not playerState — so
+                            // the editor doesn't recompose on every position tick.
+                            // Only positionMs and isPlaying come from playerState.
+                            val song = libState.songs.find { it.id == route.songId }
 
                             if (song == null) {
                                 navController.popBackStack()
@@ -281,10 +290,14 @@ fun DevLyricApp(viewModel: MusicViewModel, openNowPlaying: Boolean = false) {
                             }
 
                             LyricEditorScreen(
-                                song          = song,
-                                isSaving      = isSaving,
-                                saveMessage   = saveMessage,
-                                onSaveAndBake = { lyricText, format ->
+                                song              = song,
+                                currentPositionMs = ps.positionMs,
+                                isPlaying         = ps.isPlaying,
+                                onPlayPause       = viewModel::togglePlayPause,
+                                onSeek            = viewModel::seekTo,
+                                isSaving          = isSaving,
+                                saveMessage       = saveMessage,
+                                onSaveAndBake     = { lyricText, format ->
                                     isSaving = true
                                     viewModel.bakeLyricsToSong(song, lyricText, format) { success, msg ->
                                         isSaving    = false
