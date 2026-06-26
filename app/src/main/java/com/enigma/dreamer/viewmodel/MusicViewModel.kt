@@ -585,6 +585,27 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
+        fun reorderQueue(newQueue: List<Song>) {
+            val service = musicService ?: return
+            service.reorderQueue(newQueue)
+            mutatePlayer {
+                val newIndex = newQueue.indexOfFirst {
+                    it.id == playbackState.currentSong?.id
+                }.coerceAtLeast(0)
+                copy(
+                    playbackState = playbackState.copy(
+                        queue      = newQueue,
+                        queueIndex = newIndex
+                    )
+                )
+            }
+        }
+
+        fun reorderPlaylistSongs(playlistId: Long, newSongIds: List<Long>) {
+            viewModelScope.launch {
+                repo.reorderPlaylistSongs(playlistId, newSongIds)
+            }
+        }
     }
 
     private fun findCurrentLyricLine(doc: LyricDocument, posMs: Long): Int {
@@ -636,5 +657,33 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     companion object {
         private val DEFAULT_BG = "#0D0D0D".toColorInt()
+    }
+
+    private fun syncEqStateFromService() {
+      val service = musicService ?: return
+       val eq      = service.equalizerController
+       mutatePlayer {
+           copy(eqState = EqState(
+               isEnabled      = eq.isEnabled,
+               bassBoostLevel = eq.bassBoostLevel,
+               currentPreset  = eq.currentPreset,
+               presetNames    = eq.presetNames
+           ))
+       }
+   }
+
+    fun setEqEnabled(enabled: Boolean) {
+        musicService?.setEqEnabled(enabled)
+        mutatePlayer { copy(eqState = eqState.copy(isEnabled = enabled)) }
+    }
+
+    fun setEqPreset(preset: Short) {
+        musicService?.setEqPreset(preset)
+        mutatePlayer { copy(eqState = eqState.copy(currentPreset = preset)) }
+    }
+
+    fun setEqBassBoost(strength: Short) {
+        musicService?.setEqBassBoost(strength)
+        mutatePlayer { copy(eqState = eqState.copy(bassBoostLevel = strength)) }
     }
 }

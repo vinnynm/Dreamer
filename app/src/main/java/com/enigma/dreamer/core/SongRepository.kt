@@ -13,6 +13,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
+import androidx.room.withTransaction
 import java.io.File
 import androidx.core.net.toUri
 
@@ -358,4 +359,22 @@ class SongRepository(private val context: Context) {
 
         return runCatching { LyricBaker.extractLyrics(bytes, ext) }.getOrNull()
     }
+
+    suspend fun reorderPlaylistSongs(playlistId: Long, newSongIds: List<Long>) =
+     withContext(Dispatchers.IO) {
+         // Delete all cross-refs for this playlist, then re-insert with
+        // updated position values. Wrap in a transaction for atomicity.
+        db.withTransaction {
+            // We need a raw delete here since PlaylistDao.removeSongFromPlaylist
+            // removes individual songs. Add this DAO method:
+            //   @Query("DELETE FROM playlist_songs WHERE playlistId = :id")
+             //   suspend fun clearPlaylist(id: Long)
+           playlistDao.clearPlaylist(playlistId)
+            newSongIds.forEachIndexed { idx, songId ->
+               playlistDao.addSongToPlaylist(
+                   PlaylistSongCrossRef(playlistId, songId, idx)
+                )
+             }
+         }
+     }
 }

@@ -35,6 +35,8 @@ import com.enigma.dreamer.core.BufferingState
 import com.enigma.dreamer.core.PlaybackState
 import com.enigma.dreamer.core.RepeatMode as AppRepeatMode
 import com.enigma.dreamer.core.Song
+import com.enigma.dreamer.core.EqState
+import com.enigma.dreamer.ui.components.EqSheet
 import com.enigma.dreamer.ui.components.LyricLineItem
 import com.enigma.dreamer.ui.components.PlaybackControls
 import com.enigma.dreamer.ui.components.PlaybackSlider
@@ -64,15 +66,14 @@ fun NowPlayingScreen(
     onCancelSleepTimer: () -> Unit,
     onOpenSettings: () -> Unit,
     onBack: () -> Unit,
-    onSkipToQueue: (Int) -> Unit
+    onSkipToQueue: (Int) -> Unit,
+    // 8.8: EQ state + callbacks
+    eqState: EqState = EqState(),
+    onToggleEq: (Boolean) -> Unit = {},
+    onEqPresetChange: (Short) -> Unit = {},
+    onEqBassChange: (Short) -> Unit = {}
 ) {
-    // FIX B-2: The original code used `val song = playbackState.currentSong ?: return`,
-    // which emitted a completely blank (transparent/black) composable when no song was
-    // loaded — no message, no back button, no navigation. This happened reliably when
-    // the user tapped the notification before the session had finished restoring.
-    //
-    // Now we render a proper "Nothing playing" empty state with a back button so the
-    // user is never stuck staring at a void with no way out.
+    // FIX B-2: proper empty state instead of blank screen
     val song = playbackState.currentSong
     if (song == null) {
         NowPlayingEmptyState(onBack = onBack)
@@ -92,6 +93,8 @@ fun NowPlayingScreen(
     )
 
     var showOptionsMenu by remember { mutableStateOf(false) }
+    // 8.8: EQ sheet toggle
+    var showEqSheet by remember { mutableStateOf(false) }
 
     LaunchedEffect(currentLyricLine) {
         if (showLyrics && currentLyricLine >= 0) {
@@ -106,19 +109,26 @@ fun NowPlayingScreen(
     Box(modifier = Modifier.fillMaxSize()) {
 
         // ── Layer 1: blurred album art atmosphere ─────────────────────────────
-        AsyncImage(
-            model = ImageRequest.Builder(LocalContext.current)
-                .data(song.albumArtUri)
-                .crossfade(true)
-                .placeholder(R.drawable.ic_default_album_art)
-                .error(R.drawable.ic_default_album_art)
-                .build(),
-            contentDescription = null,
-            contentScale       = ContentScale.Crop,
-            modifier           = Modifier
-                .fillMaxSize()
-                .blur(60.dp)
-        )
+        // 8.7: Crossfade album art on song transition using Coil's crossfade(true)
+        // combined with key(song.id) on the AsyncImage so Coil starts a new
+        // crossfade request whenever the song changes, rather than abruptly
+        // swapping the bitmap in-place. The key() forces Compose to dispose and
+        // re-compose the AsyncImage for each new song.
+        key(song.id) {
+            AsyncImage(
+                model = ImageRequest.Builder(LocalContext.current)
+                    .data(song.albumArtUri)
+                    .crossfade(600)                // 600 ms crossfade (8.7)
+                    .placeholder(R.drawable.ic_default_album_art)
+                    .error(R.drawable.ic_default_album_art)
+                    .build(),
+                contentDescription = null,
+                contentScale       = ContentScale.Crop,
+                modifier           = Modifier
+                    .fillMaxSize()
+                    .blur(60.dp)
+            )
+        }
 
         // ── Layer 2: dominant-color gradient overlay ──────────────────────────
         Box(
@@ -214,7 +224,9 @@ fun NowPlayingScreen(
                             sleepTimerRemaining = playbackState.sleepTimer.remainingMs,
                             onSpeedChange       = { onSpeedChange(it); showOptionsMenu = false },
                             onStartSleepTimer   = { onStartSleepTimer(it); showOptionsMenu = false },
-                            onCancelSleepTimer  = { onCancelSleepTimer(); showOptionsMenu = false }
+                            onCancelSleepTimer  = { onCancelSleepTimer(); showOptionsMenu = false },
+                            // 8.8
+                            onOpenEq            = { showEqSheet = true; showOptionsMenu = false }
                         )
                     }
                 }
@@ -249,7 +261,7 @@ fun NowPlayingScreen(
                     }
                 }
 
-                // ── Song info ─────────────────────────────────────────────────
+                // ── Song info (8.1: added album title) ────────────────────────
                 Column(
                     modifier            = Modifier
                         .fillMaxWidth()
@@ -275,6 +287,17 @@ fun NowPlayingScreen(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
+                    // 8.1: Album title beneath artist, subtly dimmer
+                    if (song.album.isNotBlank() && song.album != "Unknown Album") {
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            song.album,
+                            style    = MaterialTheme.typography.bodySmall,
+                            color    = fgComposeColor.copy(alpha = 0.45f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
                 }
 
                 Spacer(Modifier.height(20.dp))
@@ -405,17 +428,20 @@ fun NowPlayingScreen(
                                     .background(Surface3),
                                 contentAlignment = Alignment.Center
                             ) {
-                                AsyncImage(
-                                    model = ImageRequest.Builder(LocalContext.current)
-                                        .data(next.albumArtUri)
-                                        .crossfade(true)
-                                        .placeholder(R.drawable.ic_default_album_art)
-                                        .error(R.drawable.ic_default_album_art)
-                                        .build(),
-                                    contentDescription = null,
-                                    contentScale       = ContentScale.Crop,
-                                    modifier           = Modifier.fillMaxSize()
-                                )
+                                // 8.7: crossfade here too
+                                key(next.id) {
+                                    AsyncImage(
+                                        model = ImageRequest.Builder(LocalContext.current)
+                                            .data(next.albumArtUri)
+                                            .crossfade(400)
+                                            .placeholder(R.drawable.ic_default_album_art)
+                                            .error(R.drawable.ic_default_album_art)
+                                            .build(),
+                                        contentDescription = null,
+                                        contentScale       = ContentScale.Crop,
+                                        modifier           = Modifier.fillMaxSize()
+                                    )
+                                }
                             }
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
@@ -446,19 +472,21 @@ fun NowPlayingScreen(
             }
         }
     }
+
+    // 8.8: EQ bottom sheet
+    if (showEqSheet) {
+        EqSheet(
+            eqState        = eqState,
+            onDismiss      = { showEqSheet = false },
+            onToggleEq     = onToggleEq,
+            onPresetChange = onEqPresetChange,
+            onBassChange   = onEqBassChange
+        )
+    }
 }
 
 // ── Empty state — FIX B-2 ────────────────────────────────────────────────────
 
-/**
- * Shown when [NowPlayingScreen] is opened but no song is loaded yet — e.g. the
- * user tapped the notification before the session restore completed, or navigated
- * here from a deep link with an empty queue.
- *
- * Previously the screen was completely blank (bare `return` in a Composable),
- * leaving the user stranded with no UI and no way to go back. This replaces that
- * with a minimal but complete empty state that includes a working back button.
- */
 @Composable
 private fun NowPlayingEmptyState(onBack: () -> Unit) {
     Box(
@@ -504,7 +532,7 @@ private fun NowPlayingEmptyState(onBack: () -> Unit) {
     }
 }
 
-// ── Vinyl Disc Composable ─────────────────────────────────────────────────────
+// ── Vinyl Disc ────────────────────────────────────────────────────────────────
 
 @Composable
 private fun VinylDisc(
@@ -560,7 +588,7 @@ private fun VinylDisc(
                 .border(0.5.dp, Color.White.copy(alpha = 0.08f), CircleShape),
             contentAlignment = Alignment.Center
         ) {
-            Canvas(modifier = Modifier.fillMaxSize()) {
+            androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
                 val center = size.center
                 val radius = size.minDimension / 2f
                 for (i in 1..8) {
@@ -573,19 +601,22 @@ private fun VinylDisc(
                 }
             }
 
-            AsyncImage(
-                model = ImageRequest.Builder(LocalContext.current)
-                    .data(song.albumArtUri)
-                    .crossfade(true)
-                    .placeholder(R.drawable.ic_default_album_art)
-                    .error(R.drawable.ic_default_album_art)
-                    .build(),
-                contentDescription = "Album art",
-                contentScale       = ContentScale.Crop,
-                modifier           = Modifier
-                    .size(250.dp)
-                    .clip(CircleShape)
-            )
+            // 8.7: crossfade album art inside the vinyl disc on song transition
+            key(song.id) {
+                AsyncImage(
+                    model = ImageRequest.Builder(LocalContext.current)
+                        .data(song.albumArtUri)
+                        .crossfade(600)
+                        .placeholder(R.drawable.ic_default_album_art)
+                        .error(R.drawable.ic_default_album_art)
+                        .build(),
+                    contentDescription = "Album art",
+                    contentScale       = ContentScale.Crop,
+                    modifier           = Modifier
+                        .size(250.dp)
+                        .clip(CircleShape)
+                )
+            }
 
             Box(
                 modifier = Modifier
@@ -615,18 +646,33 @@ private fun OptionsDropdown(
     sleepTimerRemaining: Long,
     onSpeedChange: (Float) -> Unit,
     onStartSleepTimer: (Int) -> Unit,
-    onCancelSleepTimer: () -> Unit
+    onCancelSleepTimer: () -> Unit,
+    onOpenEq: () -> Unit          // 8.8
 ) {
     DropdownMenu(
         expanded         = expanded,
         onDismissRequest = onDismiss,
         containerColor   = Surface2
     ) {
+        // 8.8: Equalizer entry at the top of the menu
         DropdownMenuItem(
-            text    = { Text("Playback Speed", style = MaterialTheme.typography.labelSmall, color = Amber) },
-            onClick = {},
-            enabled = false
+            text = {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment     = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Filled.Equalizer, null,
+                        tint = Amber, modifier = Modifier.size(16.dp))
+                    Text("Equalizer", color = TextPrimary,
+                        style = MaterialTheme.typography.bodyMedium)
+                }
+            },
+            onClick = onOpenEq
         )
+
+        HorizontalDivider(color = Surface3, modifier = Modifier.padding(vertical = 4.dp))
+
+        
         listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f).forEach { speed ->
             DropdownMenuItem(
                 text = {
@@ -686,9 +732,7 @@ private fun OptionsDropdown(
     }
 }
 
-// ── Preview ───────────────────────────────────────────────────────────────────
-// FIX B-16: All parameters now use named arguments so the trailing lambda
-// is unambiguously bound to onSkipToQueue, not onBack.
+// ── Previews — FIX B-16 (named args) ────────────────────────────────────────
 
 @Preview
 @Composable
@@ -742,14 +786,13 @@ private fun NowPlayingPrev() {
         onCancelSleepTimer = {},
         onOpenSettings     = {},
         onBack             = {},
-        onSkipToQueue      = {}   // FIX B-16: named, no ambiguous trailing lambda
+        onSkipToQueue      = {}
     )
 }
 
 @Preview
 @Composable
 private fun NowPlayingEmptyPrev() {
-    // Verify the empty state renders correctly for B-2
     NowPlayingScreen(
         playbackState      = PlaybackState(currentSong = null),
         currentLyricLine   = -1,

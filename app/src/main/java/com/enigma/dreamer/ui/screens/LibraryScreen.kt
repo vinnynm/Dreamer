@@ -62,9 +62,6 @@ fun LibraryScreen(
     onMiniPlayerClick: () -> Unit,
     onMiniPlayPause: () -> Unit,
     onMiniNext: () -> Unit,
-    // FIX B-5: added onMiniPrevious so the swipe-right gesture in MiniPlayer
-    // actually triggers the previous-track action. Wire this to viewModel::previous
-    // in MainActivity / the composable that hosts LibraryScreen.
     onMiniPrevious: () -> Unit = {},
     onRescan: () -> Unit = {}
 ) {
@@ -85,6 +82,8 @@ fun LibraryScreen(
             LibraryTopBar(
                 selectedTab           = pagerState.currentPage,
                 searchQuery           = searchQuery,
+                totalSongCount        = songs.size,
+                filteredSongCount     = filteredSongs.size,
                 isScanning            = scanProgress != null,
                 scanProgress          = scanProgress,
                 onSearch              = onSearch,
@@ -108,7 +107,6 @@ fun LibraryScreen(
                         dominantColor = Color(dominantColor),
                         onPlayPause   = onMiniPlayPause,
                         onNext        = onMiniNext,
-                        // FIX B-5: previously omitted — swipe-right was dead code
                         onPrevious    = onMiniPrevious,
                         onClick       = onMiniPlayerClick
                     )
@@ -214,6 +212,8 @@ fun LibraryScreen(
 private fun LibraryTopBar(
     selectedTab: Int,
     searchQuery: String,
+    totalSongCount: Int,
+    filteredSongCount: Int,
     isScanning: Boolean,
     scanProgress: Int?,
     onSearch: (String) -> Unit,
@@ -222,6 +222,9 @@ private fun LibraryTopBar(
     onTabSelect: (Int) -> Unit,
     onRescan: () -> Unit
 ) {
+    // 8.3: number of songs hidden by the current search filter
+    val hiddenCount = if (searchQuery.isNotBlank()) totalSongCount - filteredSongCount else 0
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -310,7 +313,49 @@ private fun LibraryTopBar(
             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search)
         )
 
-        Spacer(Modifier.height(12.dp))
+        // 8.3: "X songs hidden by search" banner — only visible when search
+        // is active and fewer results are shown than the full library.
+        AnimatedVisibility(
+            visible = hiddenCount > 0 && selectedTab == 0,
+            enter   = fadeIn() + expandVertically(),
+            exit    = fadeOut() + shrinkVertically()
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 6.dp, bottom = 2.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Surface2)
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment     = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Icon(
+                    Icons.Filled.FilterList, null,
+                    tint     = TextMuted,
+                    modifier = Modifier.size(14.dp)
+                )
+                Text(
+                    "$hiddenCount song${if (hiddenCount != 1) "s" else ""} hidden by search",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextMuted,
+                    modifier = Modifier.weight(1f)
+                )
+                // Tappable "Clear" shortcut so the user doesn't have to reach the X in the field
+                TextButton(
+                    onClick        = { onSearch("") },
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                ) {
+                    Text(
+                        "Clear",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Amber
+                    )
+                }
+            }
+        }
+
+        Spacer(Modifier.height(8.dp))
 
         TabRow(
             selectedTabIndex = selectedTab,

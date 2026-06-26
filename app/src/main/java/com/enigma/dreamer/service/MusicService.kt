@@ -15,6 +15,7 @@ import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
+import androidx.core.graphics.scale
 
 @OptIn(UnstableApi::class)
 class MusicService : MediaLibraryService() {
@@ -46,6 +47,8 @@ class MusicService : MediaLibraryService() {
     private lateinit var player:               ExoPlayer
     private lateinit var mediaSession:         MediaLibrarySession
     private lateinit var notificationProvider: DreamerNotificationProvider
+
+    val equalizerController = EqualizerController()
 
     // ── Album art ─────────────────────────────────────────────────────────────
 
@@ -110,16 +113,12 @@ class MusicService : MediaLibraryService() {
     }
 
     override fun onDestroy() {
-        // FIX A-4: commit() in onDestroy for the same reason — we're about to
-        // lose the process and async apply() is not guaranteed to flush in time.
         persistStateSync()
         cancelSleepTimer()
         serviceScope.cancel()
         mediaSession.release()
+        equalizerController.release()   // [ADD] release before player.release()
         player.release()
-        // FIX B-17: clear reference before recycling so a concurrent
-        // updateAlbumArt call that checks albumArtBitmap sees null instead of
-        // a recycled bitmap.
         val bmp = albumArtBitmap
         albumArtBitmap = null
         bmp?.recycle()
@@ -158,6 +157,10 @@ class MusicService : MediaLibraryService() {
             .setHandleAudioBecomingNoisy(true)
             .build()
         player.shuffleModeEnabled = false
+
+        // [ADD] Attach EQ effects to the ExoPlayer audio session.
+        // audioSessionId is available immediately after build() on ExoPlayer 1.x.
+        equalizerController.attach(player.audioSessionId)
     }
 
     // ── Build MediaSession ────────────────────────────────────────────────────
@@ -599,11 +602,9 @@ class MusicService : MediaLibraryService() {
 
     private fun scaleBitmap(src: Bitmap, maxSide: Int): Bitmap {
         val scale = maxSide.toFloat() / maxOf(src.width, src.height)
-        return Bitmap.createScaledBitmap(
-            src,
-            (src.width  * scale).toInt().coerceAtLeast(1),
-            (src.height * scale).toInt().coerceAtLeast(1),
-            true
+        return src.scale(
+            (src.width * scale).toInt().coerceAtLeast(1),
+            (src.height * scale).toInt().coerceAtLeast(1)
         )
     }
 
@@ -612,4 +613,34 @@ class MusicService : MediaLibraryService() {
         bmp.compress(Bitmap.CompressFormat.JPEG, 85, out)
         return out.toByteArray()
     }
+
+    fun reorderQueue(newQueue: List<Song>) {
+    originalQueue = newQueue
+     val currentId = _playbackState.value.currentSong?.id
+    val newIndex  = newQueue.indexOfFirst { it.id == currentId }.coerceAtLeast(0)
+     player.setMediaItems(newQueue.map { it.toMediaItem() }, newIndex,
+                          player.currentPosition)
+     _playbackState.value = _playbackState.value.copy(
+        queue = newQueue, queueIndex = newIndex
+    )
+     persistState()
+ }
+
+
+
+// ── [ADD] Public API methods called by the ViewModel ─────────────────────────
+
+    fun setEqEnabled(enabled: Boolean) {
+        equalizerController.setEnabled(enabled)
+    }
+
+    fun setEqPreset(preset: Short) {
+        equalizerController.setPreset(preset)
+    }
+
+    fun setEqBassBoost(strength: Short) {
+        equalizerController.setBassBoost(strength)
+    }
+
+    fun getEqPresetNames(): List<String> = equalizerController.presetNames
 }

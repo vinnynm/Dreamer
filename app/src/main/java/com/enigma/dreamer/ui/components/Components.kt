@@ -28,6 +28,7 @@ import com.enigma.dreamer.R
 import com.enigma.dreamer.core.Song
 import com.enigma.dreamer.ui.theme.*
 import kotlinx.coroutines.launch
+import kotlin.math.absoluteValue
 
 // ── Album Artwork ─────────────────────────────────────────────────────────────
 
@@ -212,13 +213,14 @@ fun SongListItem(
     isPlaying: Boolean = false,
     onClick: () -> Unit,
     onLongClick: (() -> Unit)? = null,
-    trailingContent: (@Composable () -> Unit)? = null
+    trailingContent: (@Composable () -> Unit)? = null,
+    modifier: Modifier = Modifier
 ) {
     val bgColor by animateColorAsState(
         if (isPlaying) Surface3 else Color.Transparent, label = "bg"
     )
     Row(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .background(bgColor, RoundedCornerShape(12.dp))
             .combinedClickable(onClick = onClick, onLongClick = onLongClick)
@@ -309,21 +311,20 @@ fun LyricLineItem(
 // ── Mini Player ───────────────────────────────────────────────────────────────
 
 /**
- * FIX B-5: Added [onPrevious] parameter and wired it to the swipe-right gesture.
+ * 8.2 — Swipe gesture visual hints.
  *
- * Previously, swiping right gave physical drag feedback (the card translated with
- * the finger) but silently did nothing when released — confusing and broken UX.
- * The gesture now correctly triggers [onPrevious] when the drag exceeds the
- * threshold in either direction, matching the visual feedback the user receives.
+ * Previously the card gave physical drag feedback (it translated with the
+ * finger) but showed no indicator of what a swipe *would do*. Users had
+ * no affordance to discover the gesture.
  *
- * Call-site change required in LibraryScreen and wherever MiniPlayer is hosted:
- *   add `onPrevious = viewModel::previous`  (or equivalent)
- *
- * Other MiniPlayer features are unchanged:
- *  - Spinning vinyl disc with frozen-angle pause
- *  - Dynamic background gradient from album art dominant color
- *  - Thin Amber progress bar at the bottom edge
- *  - Swipe-left → next track (unchanged)
+ * Now:
+ *  - A faint left-arrow (◀) fades in on the left edge as the user drags right
+ *    (towards previous track). Its alpha scales with drag distance so it only
+ *    appears when the gesture is intentional.
+ *  - A faint right-arrow (▶) fades in on the right edge as the user drags left
+ *    (towards next track), symmetrically.
+ *  - Both arrows are gone at rest so they don't clutter the idle UI.
+ *  - The swipe-right → previous action was wired in Phase 5 (FIX B-5).
  */
 @Composable
 fun MiniPlayer(
@@ -332,7 +333,6 @@ fun MiniPlayer(
     progress: Float,
     onPlayPause: () -> Unit,
     onNext: () -> Unit,
-    // FIX B-5: was missing — swipe-right was dead code without this parameter.
     onPrevious: () -> Unit = {},
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
@@ -384,6 +384,12 @@ fun MiniPlayer(
         alpha = bgColor.alpha
     )
 
+    // 8.2: Arrow hint alpha — scales 0→1 as drag approaches threshold.
+    // leftArrowAlpha  shows when dragging right (→ previous)
+    // rightArrowAlpha shows when dragging left  (→ next)
+    val leftArrowAlpha  = (animatedDragOffset / swipeThreshold).coerceIn(0f, 1f)
+    val rightArrowAlpha = (-animatedDragOffset / swipeThreshold).coerceIn(0f, 1f)
+
     Box(
         modifier = modifier
             .fillMaxWidth()
@@ -396,11 +402,9 @@ fun MiniPlayer(
                 detectHorizontalDragGestures(
                     onDragEnd = {
                         when {
-                            // FIX B-5: swipe left → next (was already working)
                             dragOffset < -swipeThreshold -> {
                                 scope.launch { onNext(); dragOffset = 0f }
                             }
-                            // FIX B-5: swipe right → previous (was dead code — now wired)
                             dragOffset > swipeThreshold -> {
                                 scope.launch { onPrevious(); dragOffset = 0f }
                             }
@@ -423,6 +427,32 @@ fun MiniPlayer(
                 .height(2.dp)
                 .background(Amber.copy(alpha = 0.9f))
         )
+
+        // 8.2: Left arrow hint — fades in when swiping right (previous)
+        if (leftArrowAlpha > 0.01f) {
+            Icon(
+                imageVector        = Icons.Filled.SkipPrevious,
+                contentDescription = null,
+                tint               = Color.White.copy(alpha = leftArrowAlpha * 0.75f),
+                modifier           = Modifier
+                    .align(Alignment.CenterStart)
+                    .padding(start = 10.dp)
+                    .size(20.dp)
+            )
+        }
+
+        // 8.2: Right arrow hint — fades in when swiping left (next)
+        if (rightArrowAlpha > 0.01f) {
+            Icon(
+                imageVector        = Icons.Filled.SkipNext,
+                contentDescription = null,
+                tint               = Color.White.copy(alpha = rightArrowAlpha * 0.75f),
+                modifier           = Modifier
+                    .align(Alignment.CenterEnd)
+                    .padding(end = 10.dp)
+                    .size(20.dp)
+            )
+        }
 
         Row(
             modifier              = Modifier
