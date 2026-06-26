@@ -96,4 +96,7 @@ dependencies {
     // ── Navigation ────────────────────────────────────────────────────────────
     implementation(libs.androidx.navigation.compose)
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+
+    // ── Reorderable List ──────────────────────────────────────────────────────
+    implementation("sh.calvin.reorderable:reorderable:3.1.0")
 }
