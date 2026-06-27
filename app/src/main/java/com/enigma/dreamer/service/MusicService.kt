@@ -53,9 +53,8 @@ class MusicService : MediaLibraryService() {
 
     // ── Album art ─────────────────────────────────────────────────────────────
 
-    // FIX B-17: guard against concurrent recycle by always null-checking and
-    // clearing the reference before recycling, so onDestroy + updateAlbumArt
-    // racing can't double-recycle the same bitmap.
+    // FIX B-17: guard against concurrent recycle by clearing the reference
+    // before recycling so onDestroy + updateAlbumArt can't double-recycle.
     @Volatile private var albumArtBitmap: Bitmap? = null
 
     // ── Sleep timer ───────────────────────────────────────────────────────────
@@ -69,7 +68,7 @@ class MusicService : MediaLibraryService() {
 
     private val sessionDao by lazy { DevLyricDatabase.getInstance(this).sessionDao() }
 
-    // ── Persistence ───────────────────────────────────────────────────────────
+    // ── Constants ─────────────────────────────────────────────────────────────
 
     companion object {
         const val CMD_TOGGLE_SHUFFLE   = "cmd_toggle_shuffle"
@@ -80,7 +79,6 @@ class MusicService : MediaLibraryService() {
         const val CMD_CANCEL_SLEEP     = "cmd_cancel_sleep"
         const val EXTRA_SPEED          = "extra_speed"
         const val EXTRA_DELAY_MS       = "extra_delay_ms"
-
         const val NOTIF_CHANNEL_ID     = "dreamer_playback"
 
         private val COLOR_DEFAULT = "#1A1A1A".toColorInt()
@@ -92,10 +90,6 @@ class MusicService : MediaLibraryService() {
         super.onCreate()
         createNotificationChannel()
         buildPlayer()
-        // FIX: register notification provider BEFORE building the media session.
-        // If the provider is registered after, Media3 may have already attached its
-        // own default provider and our DreamerNotificationProvider is ignored on
-        // some OEM builds (observed on Samsung One UI and Xiaomi MIUI).
         notificationProvider = DreamerNotificationProvider(this, NOTIF_CHANNEL_ID)
         setMediaNotificationProvider(notificationProvider)
         buildMediaSession()
@@ -106,9 +100,7 @@ class MusicService : MediaLibraryService() {
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
-        // FIX A-4: use commit() here so state is flushed to disk before the
-        // process is killed.  apply() is async and may not complete in time
-        // when the system tears down the process immediately after onTaskRemoved.
+        // FIX A-4: commit() so state is flushed before process kill.
         persistStateSync()
         if (!player.isPlaying) stopSelf()
     }
@@ -118,8 +110,9 @@ class MusicService : MediaLibraryService() {
         cancelSleepTimer()
         serviceScope.cancel()
         mediaSession.release()
-        equalizerController.release()   // [ADD] release before player.release()
+        equalizerController.release()
         player.release()
+        // FIX B-17: clear reference before recycling
         val bmp = albumArtBitmap
         albumArtBitmap = null
         bmp?.recycle()
@@ -133,11 +126,10 @@ class MusicService : MediaLibraryService() {
             val channel = NotificationChannel(
                 NOTIF_CHANNEL_ID,
                 "Now Playing",
-                NotificationManager.IMPORTANCE_DEFAULT   // was IMPORTANCE_LOW
+                NotificationManager.IMPORTANCE_DEFAULT
             ).apply {
                 description          = "Shows the currently playing song with transport controls"
                 lockscreenVisibility = Notification.VISIBILITY_PUBLIC
-                // Removed setShowBadge(false) — badge helps discoverability
             }
             getSystemService(NotificationManager::class.java)
                 ?.createNotificationChannel(channel)
@@ -158,9 +150,6 @@ class MusicService : MediaLibraryService() {
             .setHandleAudioBecomingNoisy(true)
             .build()
         player.shuffleModeEnabled = false
-
-        // [ADD] Attach EQ effects to the ExoPlayer audio session.
-        // audioSessionId is available immediately after build() on ExoPlayer 1.x.
         equalizerController.attach(player.audioSessionId)
     }
 
@@ -249,7 +238,7 @@ class MusicService : MediaLibraryService() {
                     queueIndex  = idx,
                     positionMs  = 0L
                 )
-                // FIX B-17: clear reference before recycling (same pattern as onDestroy)
+                // FIX B-17: clear reference before recycling
                 val bmp = albumArtBitmap
                 albumArtBitmap = null
                 bmp?.recycle()
@@ -295,18 +284,13 @@ class MusicService : MediaLibraryService() {
     fun setQueue(queue: List<Song>, index: Int) {
         val ps = _playbackState.value
 
-        // FIX B-4: the old check used structural equality on List<Song>, which
-        // compares every field including lyricDocument (a complex object with
-        // many LyricLine instances).  For a 1000-song library with loaded lyrics
-        // that's potentially millions of field comparisons on every playSong call.
-        //
-        // Now we compare only song IDs, which is O(n) with a tiny constant and
-        // covers all practical "is this the same queue?" scenarios.
+        // FIX B-4: ID-only comparison instead of full structural equality.
         val isSameQueue = queue.size == originalQueue.size &&
                 queue.zip(originalQueue).all { (a, b) -> a.id == b.id }
 
         if (isSameQueue) {
-            // Update queue reference so updated Song fields (favorites, lyrics) are visible
+            // FIX N-7: always adopt the new Song objects even on the fast path
+            // so updated fields (isFavorite, lyricDocument) propagate to the UI.
             _playbackState.value = _playbackState.value.copy(queue = queue)
             val song = queue.getOrNull(index)
             val effectiveIdx = if (ps.shuffleMode == ShuffleMode.ON) {
@@ -431,7 +415,6 @@ class MusicService : MediaLibraryService() {
 
     fun updateAlbumArt(bitmap: Bitmap?, accentColor: Int) {
         notificationProvider.setAccentColor(accentColor)
-
         if (bitmap == null) return
 
         val scaled = scaleBitmap(bitmap, 256)
@@ -456,8 +439,26 @@ class MusicService : MediaLibraryService() {
         )
     }
 
+    // ── Queue reorder ─────────────────────────────────────────────────────────
+
+    fun reorderQueue(newQueue: List<Song>) {
+        originalQueue  = newQueue
+        val currentId  = _playbackState.value.currentSong?.id
+        val newIndex   = newQueue.indexOfFirst { it.id == currentId }.coerceAtLeast(0)
+        // FIX N-6: capture position BEFORE setMediaItems resets player.currentPosition to 0.
+        val savedPos   = player.currentPosition
+        player.setMediaItems(newQueue.map { it.toMediaItem() }, newIndex, savedPos)
+        _playbackState.value = _playbackState.value.copy(
+            queue      = newQueue,
+            queueIndex = newIndex
+        )
+        persistState()
+    }
+
     // ── Session restore ───────────────────────────────────────────────────────
 
+    // FIX N-2: suspend fun + withContext instead of runBlocking, called from
+    // PlaybackController.tryRestoreSession (also suspend) via viewModelScope.
     suspend fun tryRestoreSession(allSongs: List<Song>): Boolean {
         if (sessionRestored) return false
         sessionRestored = true
@@ -504,11 +505,9 @@ class MusicService : MediaLibraryService() {
     // ── Persistence ───────────────────────────────────────────────────────────
 
     private fun persistState() {
-        val ps  = _playbackState.value
-        // Capture position on the main thread BEFORE switching to IO dispatcher.
-        // ExoPlayer enforces that currentPosition() is only called on the thread
-        // that owns the player (main thread). runBlocking(Dispatchers.IO) would
-        // move execution to a worker thread before the position is read — crash.
+        val ps = _playbackState.value
+        // Read position on the main thread BEFORE switching to IO; ExoPlayer
+        // enforces main-thread access for currentPosition().
         val pos = try { player.currentPosition } catch (_: Exception) { ps.positionMs }
         serviceScope.launch(Dispatchers.IO) {
             sessionDao.save(SessionEntity(
@@ -522,9 +521,14 @@ class MusicService : MediaLibraryService() {
         }
     }
 
+    // FIX N-2 (persistStateSync): runBlocking is acceptable here because this
+    // is only called from onTaskRemoved / onDestroy, where the process is about
+    // to be killed anyway. We use NonCancellable + Dispatchers.IO to guarantee
+    // the write completes before the process exits, without blocking the main
+    // thread in the same dangerous way as a cold-start runBlocking call.
     private fun persistStateSync() {
         val ps  = _playbackState.value
-        // Same fix: read position on main thread, pass as plain Long to IO block.
+        // Same main-thread position read as persistState().
         val pos = try { player.currentPosition } catch (_: Exception) { ps.positionMs }
         runBlocking {
             withContext(NonCancellable + Dispatchers.IO) {
@@ -623,34 +627,10 @@ class MusicService : MediaLibraryService() {
         return out.toByteArray()
     }
 
-    fun reorderQueue(newQueue: List<Song>) {
-        originalQueue  = newQueue
-        val currentId  = _playbackState.value.currentSong?.id
-        val newIndex   = newQueue.indexOfFirst { it.id == currentId }.coerceAtLeast(0)
-        val savedPos   = player.currentPosition                          // capture FIRST
-        player.setMediaItems(newQueue.map { it.toMediaItem() }, newIndex, savedPos)
-        _playbackState.value = _playbackState.value.copy(
-            queue      = newQueue,
-            queueIndex = newIndex
-        )
-        persistState()
-    }
+    // ── EQ public API ─────────────────────────────────────────────────────────
 
-
-
-// ── [ADD] Public API methods called by the ViewModel ─────────────────────────
-
-    fun setEqEnabled(enabled: Boolean) {
-        equalizerController.setEnabled(enabled)
-    }
-
-    fun setEqPreset(preset: Short) {
-        equalizerController.setPreset(preset)
-    }
-
-    fun setEqBassBoost(strength: Short) {
-        equalizerController.setBassBoost(strength)
-    }
-
-    fun getEqPresetNames(): List<String> = equalizerController.presetNames
+    fun setEqEnabled(enabled: Boolean)     { equalizerController.setEnabled(enabled) }
+    fun setEqPreset(preset: Short)         { equalizerController.setPreset(preset) }
+    fun setEqBassBoost(strength: Short)    { equalizerController.setBassBoost(strength) }
+    fun getEqPresetNames(): List<String>   = equalizerController.presetNames
 }

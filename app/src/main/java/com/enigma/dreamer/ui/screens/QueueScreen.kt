@@ -27,20 +27,19 @@ import com.enigma.dreamer.ui.theme.*
 /**
  * Full "Up Next" queue panel.
  *
- * 8.5: Added drag-to-reorder. Rows have a drag handle (⠿ grip icon) on the
- * right side. The user long-presses the handle to begin dragging; the item
- * snaps back with a spring animation on drop.
+ * 8.5: Added drag-to-reorder.
  *
- * Implementation notes:
- *  - Uses `sh.calvin.reorderable:reorderable:<version>` (Compose-first library).
- *    Add to build.gradle:
- *      implementation "sh.calvin.reorderable:reorderable:2.4.0"
- *  - [onReorder] is called with the updated list after each completed drag so
- *    the ViewModel / MusicService can persist the new queue order.
- *  - The currently-playing item can still be dragged — the service handles
- *    seekTo correctly after a queue reorder.
- *  - Haptic feedback fires when a drag starts (LONG_PRESS) and on drop
- *    (GESTURE_END) to match system drag-and-drop conventions.
+ * FIX NEW-1: After a drag completes, the local `currentIndexLocal` is updated
+ * immediately to follow the moved item, so the amber "now playing" highlight
+ * stays on the correct row while the ViewModel processes the reorder and
+ * re-emits playerState. Without this the highlight flickers to the wrong row
+ * for one or two frames until the next state emission arrives.
+ *
+ * The correction mirrors standard reorder index-shift logic:
+ *  - If the dragged item IS the current song → its new position is to.index.
+ *  - If the current song is between from and to → shift it ±1 depending on
+ *    drag direction.
+ *  - Otherwise → current index is unaffected.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -49,19 +48,33 @@ fun QueueScreen(
     currentIndex: Int,
     onSkipTo: (Int) -> Unit,
     onClose: () -> Unit,
-    // 8.5: called with the reordered list after a drag completes
     onReorder: (List<Song>) -> Unit = {}
 ) {
-    val haptic   = LocalHapticFeedback.current
-    // Local mutable copy so drags feel instant (no round-trip to ViewModel)
+    val haptic = LocalHapticFeedback.current
+
     var items by remember(queue) { mutableStateOf(queue) }
 
-    val listState     = rememberLazyListState()
-    val reorderState  = rememberReorderableLazyListState(listState) { from, to ->
+    // FIX NEW-1: track current-song index locally so the highlight stays correct
+    // immediately after a drag, before the ViewModel re-emits playerState.
+    // Reset to the prop value whenever the external queue or index changes.
+    var currentIndexLocal by remember(queue, currentIndex) { mutableIntStateOf(currentIndex) }
+
+    val listState    = rememberLazyListState()
+    val reorderState = rememberReorderableLazyListState(listState) { from, to ->
+        // Update items immediately for instant visual feedback
         items = items.toMutableList().apply { add(to.index, removeAt(from.index)) }
+
+        // FIX NEW-1: shift currentIndexLocal to stay on the same song
+        currentIndexLocal = when (currentIndexLocal) {
+            from.index -> to.index                       // dragged song IS the current one
+            in (minOf(from.index, to.index)..maxOf(from.index, to.index)) ->
+                // current song is between the drag endpoints — shift by ±1
+                if (from.index < to.index) currentIndexLocal - 1
+                else currentIndexLocal + 1
+            else -> currentIndexLocal                    // drag didn't cross current song
+        }
     }
 
-    // Scroll to current song on open
     LaunchedEffect(currentIndex) {
         if (currentIndex >= 0) {
             listState.animateScrollToItem(currentIndex.coerceAtMost(items.size - 1))
@@ -74,16 +87,23 @@ fun QueueScreen(
             .background(Surface1)
             .statusBarsPadding()
     ) {
-        // Header
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text("Up Next", style = MaterialTheme.typography.titleLarge,
-                color = TextPrimary, modifier = Modifier.weight(1f))
-            Text("${items.size} songs", style = MaterialTheme.typography.bodySmall, color = TextMuted)
+            Text(
+                "Up Next",
+                style    = MaterialTheme.typography.titleLarge,
+                color    = TextPrimary,
+                modifier = Modifier.weight(1f)
+            )
+            Text(
+                "${items.size} songs",
+                style = MaterialTheme.typography.bodySmall,
+                color = TextMuted
+            )
             Spacer(Modifier.width(12.dp))
             IconButton(onClick = onClose) {
                 Icon(Icons.Filled.Close, "Close", tint = TextSecondary)
@@ -96,8 +116,11 @@ fun QueueScreen(
             contentPadding = PaddingValues(vertical = 8.dp),
             modifier       = Modifier.fillMaxSize()
         ) {
+            // FIX N-8: key = index only, not "${song.id}_$idx", so Compose
+            // doesn't treat every item as a different composition after a drag.
             itemsIndexed(items, key = { idx, _ -> idx }) { idx, song ->
-                val isCurrent = idx == currentIndex
+                // Use the locally-corrected index for highlight decisions
+                val isCurrent = idx == currentIndexLocal
 
                 ReorderableItem(reorderState, key = idx) { isDragging ->
                     val elevation by androidx.compose.animation.core.animateDpAsState(
@@ -125,7 +148,6 @@ fun QueueScreen(
                             verticalAlignment     = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
-                            // Track number or now-playing indicator
                             Box(Modifier.width(28.dp), contentAlignment = Alignment.Center) {
                                 if (isCurrent) NowPlayingIndicator()
                                 else Text(
@@ -160,7 +182,6 @@ fun QueueScreen(
                                 color = TextMuted
                             )
 
-                            // 8.5: drag handle
                             Icon(
                                 imageVector        = Icons.Filled.DragHandle,
                                 contentDescription = "Drag to reorder",
@@ -173,7 +194,6 @@ fun QueueScreen(
                                         },
                                         onDragStopped = {
                                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                            // Notify ViewModel of the new order once drag ends
                                             onReorder(items)
                                         }
                                     )
