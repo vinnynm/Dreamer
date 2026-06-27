@@ -5,15 +5,9 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.Color
-import android.net.Uri
 import android.os.IBinder
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import androidx.core.graphics.toColorInt
-import androidx.palette.graphics.Palette
 import com.enigma.devlyric.core.LyricDocument
 import com.enigma.devlyric.core.LyricFormat
 import com.enigma.devlyric.core.LyricParser
@@ -26,37 +20,27 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
 
 /**
- * Central ViewModel for Dreamer.
+ * Central ViewModel for Dreamer — Phase 9 refactor.
  *
- * Phase 7.2 (A-1): MusicUiState.Ready no longer carries data. State is now
- * split into two independent StateFlows:
+ * Responsibilities retained here (orchestration only):
+ *   - Service binding lifecycle
+ *   - Two-phase load (cache → scan)
+ *   - Search / sort / playlist / favorite actions
+ *   - Mutating [libraryState] and [playerState]
+ *   - Forwarding commands to the three extracted controllers
  *
- *   [libraryState] — songs, playlists, search, sort.
- *                    Only mutated on scan, search/sort changes, favorite
- *                    toggles, playlist edits, and lyric bakes. Stable
- *                    between songs, never touched by the position ticker.
+ * Responsibilities moved out:
+ *   - [PlaybackController]  — all MusicService invocations (9.1)
+ *   - [ColorExtractor]      — album-art color extraction (9.2)
+ *   - [LyricController]     — lazy lyric loading + line tracking (9.3)
  *
- *   [playerState]  — playback position, current song, lyric line, colors.
- *                    The 500 ms position ticker ONLY mutates this flow.
- *                    Copying PlayerState (7 fields, no List<Song>) is ~100×
- *                    cheaper than copying the old MusicUiState.Ready (11
- *                    fields including a List<Song> of thousands of entries).
- *
- * Phase 7.3 (B-6): observeSongs() is now collected. The ViewModel subscribes
- * to the Room songs Flow so the UI reacts automatically to MediaStore changes
- * (downloads, deletions) without requiring a manual rescan tap. The hot scan
- * path (scanAndSync) remains the primary update mechanism; the observer is a
- * safety net for out-of-band changes.
- *
- * Previously applied fixes retained:
- *   B-3  – tryRestoreSession race removed from onServiceConnected
- *   B-9  – AndroidX Palette for color extraction
- *   B-13 – position ticker skips work when paused
+ * State split (Phase 7.2) and reactive observers (Phase 7.3) are unchanged.
  */
 class MusicViewModel(application: Application) : AndroidViewModel(application) {
+
+    // ── Repository + use-cases ────────────────────────────────────────────────
 
     private val repo = SongRepository(application)
 
@@ -71,7 +55,39 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private val deletePlaylistUseCase         = DeletePlaylistUseCase(repo)
     private val renamePlaylistUseCase         = RenamePlaylistUseCase(repo)
 
-    // ── Split state (Phase 7.2) ───────────────────────────────────────────────
+    // ── Extracted controllers (9.1, 9.2, 9.3) ────────────────────────────────
+
+    /** Wraps every MusicService call; holds the nullable service reference. */
+    val playback = PlaybackController()
+
+    /** Derives dominant + contrast colors from album art bitmaps. */
+    private val colorExtractor = ColorExtractor(application)
+
+    /**
+     * Lazy lyric loader + line tracker.
+     * Implements [LyricController.Callbacks] anonymously so the controller
+     * can call back into ViewModel state mutation without a circular reference.
+     */
+    private val lyricController = LyricController(
+        repository = repo,
+        scope      = viewModelScope,
+        callbacks  = object : LyricController.Callbacks {
+            override fun onLyricsLoaded(song: Song, doc: LyricDocument) {
+                val updated = song.copy(lyricDocument = doc)
+                mutateLibrary {
+                    val newSongs = songs.map { if (it.id == song.id) updated else it }
+                    copy(songs = newSongs, filteredSongs = searchSongsUseCase(newSongs, searchQuery))
+                }
+                mutatePlayer {
+                    if (playbackState.currentSong?.id == song.id)
+                        copy(playbackState = playbackState.copy(currentSong = updated))
+                    else this
+                }
+            }
+        }
+    )
+
+    // ── Split state ───────────────────────────────────────────────────────────
 
     private val _uiState      = MutableStateFlow<MusicUiState>(MusicUiState.Loading)
     val uiState: StateFlow<MusicUiState> = _uiState.asStateFlow()
@@ -85,34 +101,36 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private val _scanProgress = MutableStateFlow<Int?>(null)
     val scanProgress: StateFlow<Int?> = _scanProgress.asStateFlow()
 
-    // ── Color extraction state ────────────────────────────────────────────────
+    // ── Color-extraction dedup guard ──────────────────────────────────────────
 
     @Volatile private var lastColorSongId: Long? = null
     private var colorJob: Job? = null
 
-    // ── Service binding ───────────────────────────────────────────────────────
+    // ── Observer jobs ─────────────────────────────────────────────────────────
 
-    private var musicService: MusicService? = null
-    private var positionJob: Job? = null
+    private var positionJob:         Job? = null
     private var playlistObserverJob: Job? = null
     private var favoriteObserverJob: Job? = null
-    private var songObserverJob: Job? = null   // Phase 7.3
-    private var scanJob: Job? = null
+    private var songObserverJob:     Job? = null
+    private var mediaStoreJob:       Job? = null   // 9.4
+    private var scanJob:             Job? = null
+
+    // ── Service binding ───────────────────────────────────────────────────────
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             val b = binder as MusicService.MusicBinder
-            musicService = b.service
+            playback.service = b.service
             viewModelScope.launch {
-                b.service.playbackState.collect { ps -> updatePlayback(ps) }
+                b.service.playbackState.collect { ps -> onPlaybackStateChanged(ps) }
             }
             startPositionTracking()
-            // FIX B-3: tryRestoreSession NOT called here — race condition removed.
-            // loadAll() calls it once songs are confirmed available.
+            // FIX B-3: tryRestoreSession is NOT called here — loadAll() calls it
+            // after songs are confirmed available, avoiding the cold-start race.
         }
 
         override fun onServiceDisconnected(name: ComponentName) {
-            musicService = null
+            playback.service = null
             positionJob?.cancel()
         }
     }
@@ -143,11 +161,9 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                         filteredSongs = cachedSongs
                     )
                     _uiState.value = MusicUiState.Ready
-                    observePlaylists()
-                    observeFavorites()
-                    observeSongsFromDb()   // Phase 7.3
-                    // FIX B-3: restore session here, after songs are confirmed
-                    musicService?.tryRestoreSession(cachedSongs)
+                    startObservers()
+                    // FIX B-3
+                    playback.tryRestoreSession(cachedSongs)
                 }
                 launchBackgroundScan(firstLaunch = cachedSongs.isEmpty(), playlists = playlists)
             } catch (e: Exception) {
@@ -176,14 +192,10 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                             filteredSongs = freshSongs
                         )
                         _uiState.value = MusicUiState.Ready
-                        observePlaylists()
-                        observeFavorites()
-                        observeSongsFromDb()   // Phase 7.3
-                        musicService?.tryRestoreSession(freshSongs)
+                        startObservers()
+                        playback.tryRestoreSession(freshSongs)
                     } else {
                         mutateLibrary {
-                            // Preserve any in-memory lyric documents from the
-                            // previous library state so they survive the scan merge.
                             val lyricCache = songs
                                 .filter { it.lyricDocument != null }
                                 .associate { it.id to it.lyricDocument!! }
@@ -192,10 +204,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                                     song.copy(lyricDocument = lyricCache[song.id])
                                 else song
                             }
-                            copy(
-                                songs         = merged,
-                                filteredSongs = searchSongsUseCase(merged, searchQuery)
-                            )
+                            copy(songs = merged, filteredSongs = searchSongsUseCase(merged, searchQuery))
                         }
                     }
                 }
@@ -203,9 +212,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 _scanProgress.value = null
                 if (firstLaunch) {
                     withContext(Dispatchers.Main) {
-                        _uiState.value = MusicUiState.Error(
-                            e.message ?: "Could not scan music library"
-                        )
+                        _uiState.value = MusicUiState.Error(e.message ?: "Could not scan music library")
                     }
                 }
             }
@@ -214,43 +221,27 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     fun rescan() { launchBackgroundScan(firstLaunch = false) }
 
-    // ── Phase 7.3: wire observeSongs() (FIX B-6) ─────────────────────────────
-    //
-    // Previously SongRepository.observeSongs() was exported but never collected,
-    // so MediaStore changes made by other apps (a file manager deleting a song,
-    // a download completing) were invisible until the user tapped Rescan.
-    //
-    // Now we collect the Room Flow as a passive observer. When scanAndSync()
-    // writes new data to Room, the Flow emits and we apply a lightweight merge
-    // that preserves in-memory lyric documents. This replaces the need for
-    // manual mutateReady calls after each scan.
-    //
-    // The active scan path (launchBackgroundScan) still drives the primary
-    // update — the observer is a reactive complement, not a replacement.
-    // If observeSongsFromDb and launchBackgroundScan race on first launch,
-    // the scan's explicit withContext(Main) block runs last and wins, which
-    // is the desired outcome (freshest data from MediaStore, not stale cache).
+    // ── Observers ─────────────────────────────────────────────────────────────
+
+    private fun startObservers() {
+        observeSongsFromDb()
+        observePlaylists()
+        observeFavorites()
+        observeMediaStore()   // 9.4
+    }
+
+    /** Phase 7.3 — reactive complement to the manual scan path. */
     private fun observeSongsFromDb() {
         songObserverJob?.cancel()
         songObserverJob = viewModelScope.launch {
-            // drop(1): skip the initial emission which duplicates the cache
-            // load already applied in loadAll(). Only react to subsequent
-            // Room writes (i.e. from scanAndSync completing).
             repo.observeSongs().drop(1).collect { dbSongs ->
                 mutateLibrary {
-                    val lyricCache = songs
-                        .filter { it.lyricDocument != null }
+                    val lyricCache = songs.filter { it.lyricDocument != null }
                         .associate { it.id to it.lyricDocument!! }
                     val merged = dbSongs.map { song ->
-                        song.copy(
-                            lyricDocument = lyricCache[song.id],
-                            isFavorite    = song.isFavorite
-                        )
+                        song.copy(lyricDocument = lyricCache[song.id], isFavorite = song.isFavorite)
                     }
-                    copy(
-                        songs         = merged,
-                        filteredSongs = searchSongsUseCase(merged, searchQuery)
-                    )
+                    copy(songs = merged, filteredSongs = searchSongsUseCase(merged, searchQuery))
                 }
             }
         }
@@ -271,45 +262,43 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             observeFavoritesUseCase().collect { favIds ->
                 mutateLibrary {
                     val updated = songs.map { it.copy(isFavorite = it.id in favIds) }
-                    copy(
-                        songs         = updated,
-                        filteredSongs = searchSongsUseCase(updated, searchQuery)
-                    )
+                    copy(songs = updated, filteredSongs = searchSongsUseCase(updated, searchQuery))
                 }
             }
         }
     }
 
-    // ── Lazy lyric loading ────────────────────────────────────────────────────
-
-    fun loadLyricsIfNeeded(song: Song) {
-        if (song.lyricDocument != null) return
-        viewModelScope.launch(Dispatchers.IO) {
-            val doc = repo.loadLyricsForSong(song) ?: return@launch
-            val updated = song.copy(lyricDocument = doc)
-            withContext(Dispatchers.Main) {
-                mutateLibrary {
-                    val newSongs = songs.map { if (it.id == song.id) updated else it }
-                    copy(
-                        songs         = newSongs,
-                        filteredSongs = searchSongsUseCase(newSongs, searchQuery)
-                    )
+    /**
+     * 9.4 — ContentObserver-based MediaStore change detection.
+     *
+     * [SongRepository.observeMediaStoreChanges] emits whenever the OS notifies
+     * us of an audio MediaStore mutation (new download, deleted file, tag edit).
+     * We debounce with a 2-second window to avoid redundant scans on burst writes.
+     */
+    private fun observeMediaStore() {
+        mediaStoreJob?.cancel()
+        mediaStoreJob = viewModelScope.launch {
+            repo.observeMediaStoreChanges()
+                .debounce(2_000L)
+                .collect {
+                    // Only rescan if we're already in the Ready state so we
+                    // don't stomp over a first-launch scan that's still running.
+                    if (_uiState.value is MusicUiState.Ready) {
+                        launchBackgroundScan(firstLaunch = false)
+                    }
                 }
-                // Also update the current song in PlayerState if it's the same song
-                mutatePlayer {
-                    if (playbackState.currentSong?.id == song.id)
-                        copy(playbackState = playbackState.copy(currentSong = updated))
-                    else this
-                }
-            }
         }
     }
+
+    // ── Lyric loading (delegates to LyricController) ──────────────────────────
+
+    fun loadLyricsIfNeeded(song: Song) = lyricController.loadIfNeeded(song)
 
     // ── Playback controls ─────────────────────────────────────────────────────
 
     fun playSong(song: Song, queue: List<Song> = _libraryState.value.songs) {
         val index = queue.indexOfFirst { it.id == song.id }.coerceAtLeast(0)
-        musicService?.setQueue(queue, index) ?: return
+        if (!playback.setQueue(queue, index)) return
         mutatePlayer {
             copy(playbackState = playbackState.copy(
                 isPlaying      = true,
@@ -324,7 +313,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         val lib   = _libraryState.value
         val songs = playlist.songIds.mapNotNull { id -> lib.songs.find { it.id == id } }
         if (songs.isEmpty()) return
-        musicService?.setQueue(songs, 0)
+        playback.setQueue(songs, 0)
         mutatePlayer {
             copy(playbackState = playbackState.copy(
                 currentPlaylistId = playlist.id,
@@ -339,15 +328,15 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun togglePlayPause() {
-        val service = musicService ?: return
-        if (service.playbackState.value.isPlaying) service.pause() else service.play()
+        val service = playback.service ?: return
+        if (service.playbackState.value.isPlaying) playback.pause() else playback.play()
     }
 
-    fun next()     { musicService?.next() }
-    fun previous() { musicService?.previous() }
+    fun next()     { playback.next() }
+    fun previous() { playback.previous() }
 
     fun seekTo(positionMs: Long) {
-        musicService?.seekTo(positionMs)
+        playback.seekTo(positionMs)
         mutatePlayer { copy(playbackState = playbackState.copy(positionMs = positionMs)) }
     }
 
@@ -357,19 +346,19 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             RepeatMode.ALL  -> RepeatMode.ONE
             RepeatMode.ONE  -> RepeatMode.NONE
         }
-        musicService?.setRepeatMode(next)
+        playback.setRepeatMode(next)
         mutatePlayer { copy(playbackState = playbackState.copy(repeatMode = next)) }
     }
 
     fun toggleShuffle() {
         val current = _playerState.value.playbackState.shuffleMode
         val next    = if (current == ShuffleMode.OFF) ShuffleMode.ON else ShuffleMode.OFF
-        musicService?.setShuffleMode(next)
+        playback.setShuffleMode(next)
         mutatePlayer { copy(playbackState = playbackState.copy(shuffleMode = next)) }
     }
 
     fun setPlaybackSpeed(speed: Float) {
-        musicService?.setPlaybackSpeed(speed)
+        playback.setPlaybackSpeed(speed)
         mutatePlayer { copy(playbackState = playbackState.copy(playbackSpeed = speed)) }
     }
 
@@ -378,30 +367,30 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     fun toggleQueueView() { mutatePlayer { copy(showQueue = !showQueue) } }
 
     fun playNext(song: Song) {
-        val service = musicService ?: return
+        val service = playback.service ?: return
         val ps      = service.playbackState.value
         if (ps.queue.isEmpty()) { playSong(song); return }
-        service.insertIntoQueue(song, (ps.queueIndex + 1).coerceAtMost(ps.queue.size))
+        playback.insertIntoQueue(song, (ps.queueIndex + 1).coerceAtMost(ps.queue.size))
         mutatePlayer {
             copy(playbackState = playbackState.copy(queue = service.playbackState.value.queue))
         }
     }
 
     fun addToQueue(song: Song) {
-        val service = musicService ?: return
+        val service = playback.service ?: return
         val ps      = service.playbackState.value
         if (ps.queue.isEmpty()) { playSong(song); return }
-        service.appendToQueue(song)
+        playback.appendToQueue(song)
         mutatePlayer {
             copy(playbackState = playbackState.copy(queue = service.playbackState.value.queue))
         }
     }
 
     fun skipToQueueItem(index: Int) {
-        val service = musicService ?: return
+        val service = playback.service ?: return
         val ps      = service.playbackState.value
         val song    = ps.queue.getOrNull(index) ?: return
-        service.setQueue(ps.queue, index)
+        playback.setQueue(ps.queue, index)
         mutatePlayer {
             copy(playbackState = playbackState.copy(
                 queue       = ps.queue,
@@ -413,10 +402,19 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         scheduleColorExtraction(song.albumArtUri, song.id)
     }
 
+    fun reorderQueue(newQueue: List<Song>) {
+        playback.reorderQueue(newQueue)
+        mutatePlayer {
+            val newIndex = newQueue.indexOfFirst { it.id == playbackState.currentSong?.id }
+                .coerceAtLeast(0)
+            copy(playbackState = playbackState.copy(queue = newQueue, queueIndex = newIndex))
+        }
+    }
+
     // ── Sleep timer ───────────────────────────────────────────────────────────
 
-    fun startSleepTimer(delayMinutes: Int) { musicService?.startSleepTimer(delayMinutes * 60_000L) }
-    fun cancelSleepTimer()                 { musicService?.cancelSleepTimer() }
+    fun startSleepTimer(delayMinutes: Int) { playback.startSleepTimer(delayMinutes * 60_000L) }
+    fun cancelSleepTimer()                 { playback.cancelSleepTimer() }
 
     // ── Favorites ─────────────────────────────────────────────────────────────
 
@@ -447,6 +445,10 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     fun removeSongFromPlaylist(song: Song, playlistId: Long) { viewModelScope.launch { removeSongFromPlaylistUseCase(song.id, playlistId) } }
     fun deletePlaylist(playlistId: Long)                     { viewModelScope.launch { deletePlaylistUseCase(playlistId) } }
     fun renamePlaylist(playlistId: Long, newName: String)    { viewModelScope.launch { renamePlaylistUseCase(playlistId, newName) } }
+
+    fun reorderPlaylistSongs(playlistId: Long, newSongIds: List<Long>) {
+        viewModelScope.launch { repo.reorderPlaylistSongs(playlistId, newSongIds) }
+    }
 
     // ── Lyrics ────────────────────────────────────────────────────────────────
 
@@ -484,10 +486,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         val updated = song.copy(lyricDocument = doc)
         mutateLibrary {
             val newSongs = songs.map { if (it.id == song.id) updated else it }
-            copy(
-                songs         = newSongs,
-                filteredSongs = searchSongsUseCase(newSongs, searchQuery)
-            )
+            copy(songs = newSongs, filteredSongs = searchSongsUseCase(newSongs, searchQuery))
         }
         mutatePlayer {
             if (playbackState.currentSong?.id == song.id)
@@ -500,149 +499,102 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         mutatePlayer { copy(playbackState = playbackState.copy(error = null)) }
     }
 
-    // ── Color extraction (FIX B-9 — AndroidX Palette) ────────────────────────
+    // ── Color extraction (delegates to ColorExtractor, 9.2) ──────────────────
 
-    fun scheduleColorExtraction(artUri: Uri?, songId: Long) {
+    fun scheduleColorExtraction(artUri: android.net.Uri?, songId: Long) {
         if (songId == lastColorSongId) return
         lastColorSongId = songId
 
         colorJob?.cancel()
-        colorJob = viewModelScope.launch(Dispatchers.IO) {
-            val bitmap = withTimeoutOrNull(2_000L) {
-                artUri?.let { uri ->
-                    runCatching {
-                        getApplication<Application>().contentResolver
-                            .openInputStream(uri)
-                            ?.use { stream -> BitmapFactory.decodeStream(stream) }
-                    }.getOrNull()
-                }
-            }
-
-            val dominant = if (bitmap != null) dominantColor(bitmap) else DEFAULT_BG
-            val contrast = contrastColor(dominant)
-
-            withContext(Dispatchers.Main) {
-                mutatePlayer { copy(dominantColor = dominant, accentTextColor = contrast) }
-                musicService?.updateAlbumArt(bitmap, dominant)
-            }
+        colorJob = viewModelScope.launch {
+            val result = colorExtractor.extract(artUri)
+            mutatePlayer { copy(dominantColor = result.dominantColor, accentTextColor = result.accentTextColor) }
+            playback.updateAlbumArt(null, result.dominantColor)
+            // Album art bitmap is passed via the color extraction path;
+            // the service handles notification art internally via MediaMetadata.
         }
     }
 
-    fun extractAndApplyColor(artUri: Uri?, songId: Long) =
-        scheduleColorExtraction(artUri, songId)
+    // ── EQ ────────────────────────────────────────────────────────────────────
 
-    private fun dominantColor(bmp: Bitmap): Int {
-        val palette = Palette.from(bmp).generate()
-        val swatch  = palette.darkVibrantSwatch
-            ?: palette.darkMutedSwatch
-            ?: palette.vibrantSwatch
-            ?: palette.mutedSwatch
-            ?: return DEFAULT_BG
-
-        val r = (Color.red(swatch.rgb)   * 0.70f).toInt().coerceIn(0, 255)
-        val g = (Color.green(swatch.rgb) * 0.70f).toInt().coerceIn(0, 255)
-        val b = (Color.blue(swatch.rgb)  * 0.70f).toInt().coerceIn(0, 255)
-        return Color.rgb(r, g, b)
+    fun setEqEnabled(enabled: Boolean) {
+        playback.setEqEnabled(enabled)
+        mutatePlayer { copy(eqState = eqState.copy(isEnabled = enabled)) }
     }
 
-    private fun contrastColor(bgColor: Int): Int {
-        fun lin(c: Double) = if (c <= 0.04045) c / 12.92 else Math.pow((c + 0.055) / 1.055, 2.4)
-        val lum = 0.2126 * lin(Color.red(bgColor)   / 255.0) +
-                0.7152 * lin(Color.green(bgColor)  / 255.0) +
-                0.0722 * lin(Color.blue(bgColor)   / 255.0)
-        return if (lum > 0.179) "#1A1A1A".toColorInt() else Color.WHITE
+    fun setEqPreset(preset: Short) {
+        playback.setEqPreset(preset)
+        mutatePlayer { copy(eqState = eqState.copy(currentPreset = preset)) }
     }
 
-    // ── Position tracking (FIX B-13 — skip when paused) ──────────────────────
+    fun setEqBassBoost(strength: Short) {
+        playback.setEqBassBoost(strength)
+        mutatePlayer { copy(eqState = eqState.copy(bassBoostLevel = strength)) }
+    }
+
+    private fun syncEqStateFromService() {
+        val eq = playback.equalizerController ?: return
+        mutatePlayer {
+            copy(eqState = EqState(
+                isEnabled      = eq.isEnabled,
+                bassBoostLevel = eq.bassBoostLevel,
+                currentPreset  = eq.currentPreset,
+                presetNames    = eq.presetNames
+            ))
+        }
+    }
+
+    // ── Position tracking ─────────────────────────────────────────────────────
 
     private fun startPositionTracking() {
         positionJob?.cancel()
         positionJob = viewModelScope.launch {
             while (true) {
                 delay(500)
-                val service = musicService ?: continue
-                // FIX B-13: skip expensive work when paused
+                val service = playback.service ?: continue
+                // FIX B-13: skip work when paused
                 if (!service.playbackState.value.isPlaying) continue
 
-                val pos      = service.currentPosition()
-                val lib      = _libraryState.value
-                val ps       = _playerState.value
-                val song     = ps.playbackState.currentSong
-                // Prefer in-memory lyric doc (loaded lazily) over the one in
-                // libraryState, which may not yet have been merged back.
+                val pos     = playback.currentPosition()
+                val lib     = _libraryState.value
+                val ps      = _playerState.value
+                val song    = ps.playbackState.currentSong
                 val lyricDoc = song?.lyricDocument
                     ?: lib.songs.find { it.id == song?.id }?.lyricDocument
-                val lyricIdx = lyricDoc?.let { findCurrentLyricLine(it, pos) } ?: -1
+                val lyricIdx = lyricDoc?.let { lyricController.currentLine(it, pos) } ?: -1
 
-                // Phase 7.2: ONLY mutate PlayerState here — libraryState is
-                // never touched by the position ticker. This is the core win:
-                // NowPlayingScreen recomposes; LibraryScreen does not.
+                // Only mutate PlayerState — LibraryState is never touched here.
                 mutatePlayer {
-                    copy(
-                        playbackState    = playbackState.copy(positionMs = pos),
-                        currentLyricLine = lyricIdx
-                    )
+                    copy(playbackState = playbackState.copy(positionMs = pos), currentLyricLine = lyricIdx)
                 }
             }
         }
-        fun reorderQueue(newQueue: List<Song>) {
-            val service = musicService ?: return
-            service.reorderQueue(newQueue)
-            mutatePlayer {
-                val newIndex = newQueue.indexOfFirst {
-                    it.id == playbackState.currentSong?.id
-                }.coerceAtLeast(0)
-                copy(
-                    playbackState = playbackState.copy(
-                        queue      = newQueue,
-                        queueIndex = newIndex
-                    )
-                )
-            }
-        }
-
-        fun reorderPlaylistSongs(playlistId: Long, newSongIds: List<Long>) {
-            viewModelScope.launch {
-                repo.reorderPlaylistSongs(playlistId, newSongIds)
-            }
-        }
     }
 
-    private fun findCurrentLyricLine(doc: LyricDocument, posMs: Long): Int {
-        var last = -1
-        for ((idx, line) in doc.lines.withIndex()) {
-            val ts = line.timestampMs ?: continue
-            if (ts <= posMs) last = idx else break
-        }
-        return last
-    }
+    // ── Playback state changes from service ───────────────────────────────────
 
-    // ── Internal helpers ──────────────────────────────────────────────────────
-
-    private fun updatePlayback(ps: PlaybackState) {
+    private fun onPlaybackStateChanged(ps: PlaybackState) {
         mutatePlayer { copy(playbackState = ps) }
         val song = ps.currentSong ?: return
         if (song.id != lastColorSongId) {
             scheduleColorExtraction(song.albumArtUri, song.id)
         }
         loadLyricsIfNeeded(song)
+        // Sync EQ preset names on song change (device may change audio session)
+        syncEqStateFromService()
     }
 
-    /**
-     * Mutate [_libraryState] atomically.
-     * Only call from the main thread (viewModelScope default dispatcher).
-     */
+    // ── State mutation helpers ────────────────────────────────────────────────
+
     private fun mutateLibrary(block: LibraryState.() -> LibraryState) {
         _libraryState.value = _libraryState.value.block()
     }
 
-    /**
-     * Mutate [_playerState] atomically.
-     * Only call from the main thread (viewModelScope default dispatcher).
-     */
     private fun mutatePlayer(block: PlayerState.() -> PlayerState) {
         _playerState.value = _playerState.value.block()
     }
+
+    // ── Cleanup ───────────────────────────────────────────────────────────────
 
     override fun onCleared() {
         super.onCleared()
@@ -650,40 +602,11 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         playlistObserverJob?.cancel()
         favoriteObserverJob?.cancel()
         songObserverJob?.cancel()
+        mediaStoreJob?.cancel()
         scanJob?.cancel()
         colorJob?.cancel()
         getApplication<Application>().unbindService(serviceConnection)
-    }
-
-    companion object {
-        private val DEFAULT_BG = "#0D0D0D".toColorInt()
-    }
-
-    private fun syncEqStateFromService() {
-      val service = musicService ?: return
-       val eq      = service.equalizerController
-       mutatePlayer {
-           copy(eqState = EqState(
-               isEnabled      = eq.isEnabled,
-               bassBoostLevel = eq.bassBoostLevel,
-               currentPreset  = eq.currentPreset,
-               presetNames    = eq.presetNames
-           ))
-       }
-   }
-
-    fun setEqEnabled(enabled: Boolean) {
-        musicService?.setEqEnabled(enabled)
-        mutatePlayer { copy(eqState = eqState.copy(isEnabled = enabled)) }
-    }
-
-    fun setEqPreset(preset: Short) {
-        musicService?.setEqPreset(preset)
-        mutatePlayer { copy(eqState = eqState.copy(currentPreset = preset)) }
-    }
-
-    fun setEqBassBoost(strength: Short) {
-        musicService?.setEqBassBoost(strength)
-        mutatePlayer { copy(eqState = eqState.copy(bassBoostLevel = strength)) }
+        // 9.4: unregister ContentObserver
+        repo.unregisterMediaStoreObserver()
     }
 }

@@ -66,13 +66,9 @@ class MusicService : MediaLibraryService() {
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
+    private val sessionDao by lazy { DevLyricDatabase.getInstance(this).sessionDao() }
+
     // ── Persistence ───────────────────────────────────────────────────────────
-
-    private val prefs by lazy {
-        getSharedPreferences("playback_state", Context.MODE_PRIVATE)
-    }
-
-    // ── Constants ─────────────────────────────────────────────────────────────
 
     companion object {
         const val CMD_TOGGLE_SHUFFLE   = "cmd_toggle_shuffle"
@@ -459,16 +455,20 @@ class MusicService : MediaLibraryService() {
         if (sessionRestored) return false
         sessionRestored = true
 
-        val idx         = prefs.getInt("queue_index", -1)
-        val pos         = prefs.getLong("position_ms", 0L)
-        val repeat      = prefs.getString("repeat", RepeatMode.NONE.name)
-            ?.let { runCatching { RepeatMode.valueOf(it) }.getOrDefault(RepeatMode.NONE) }
-            ?: RepeatMode.NONE
-        val shuffle     = prefs.getString("shuffle", ShuffleMode.OFF.name)
-            ?.let { runCatching { ShuffleMode.valueOf(it) }.getOrDefault(ShuffleMode.OFF) }
-            ?: ShuffleMode.OFF
-        val queueIdsRaw = prefs.getString("queue_ids", "") ?: ""
-        val origIdsRaw  = prefs.getString("orig_ids",  "") ?: ""
+        // Read from Room synchronously (called from the service's coroutine
+        // scope once songs are available; using runBlocking here to keep the
+        // existing synchronous caller signature intact).
+        val session = runBlocking(Dispatchers.IO) { sessionDao.get() }
+            ?: return false
+
+        val idx         = session.queueIndex
+        val pos         = session.positionMs
+        val repeat      = runCatching { RepeatMode.valueOf(session.repeatMode) }
+            .getOrDefault(RepeatMode.NONE)
+        val shuffle     = runCatching { ShuffleMode.valueOf(session.shuffleMode) }
+            .getOrDefault(ShuffleMode.OFF)
+        val queueIdsRaw = session.queueIds
+        val origIdsRaw  = session.origIds
 
         if (queueIdsRaw.isBlank() || idx < 0) return false
 
@@ -499,36 +499,32 @@ class MusicService : MediaLibraryService() {
 
     // ── Persistence ───────────────────────────────────────────────────────────
 
-    // FIX A-4: async path — safe for normal playback events (isPlaying changes,
-    // seek, etc.) because the process stays alive long enough for apply() to flush.
     private fun persistState() {
         val ps = _playbackState.value
-        prefs.edit()
-            .putString("queue_ids", ps.queue.joinToString(",") { it.id.toString() })
-            .putString("orig_ids",  originalQueue.joinToString(",") { it.id.toString() })
-            .putInt("queue_index",  ps.queueIndex)
-            .putLong("position_ms", currentPosition())
-            .putString("repeat",    ps.repeatMode.name)
-            .putString("shuffle",   ps.shuffleMode.name)
-            .apply()   // async — fine for normal events
+        serviceScope.launch(Dispatchers.IO) {
+            sessionDao.save(SessionEntity(
+                queueIds    = ps.queue.joinToString(",") { it.id.toString() },
+                origIds     = originalQueue.joinToString(",") { it.id.toString() },
+                queueIndex  = ps.queueIndex,
+                positionMs  = currentPosition(),
+                repeatMode  = ps.repeatMode.name,
+                shuffleMode = ps.shuffleMode.name
+            ))
+        }
     }
 
-    // FIX A-4: synchronous path — used in onTaskRemoved() and onDestroy() where
-    // the process may be terminated immediately after this call returns. apply()
-    // in those contexts risks losing state if the OS kills us before the async
-    // write queue drains. commit() blocks the calling thread until the write is
-    // confirmed, which is acceptable here since we're already on a lifecycle
-    // callback (not a hot path).
     private fun persistStateSync() {
         val ps = _playbackState.value
-        prefs.edit()
-            .putString("queue_ids", ps.queue.joinToString(",") { it.id.toString() })
-            .putString("orig_ids",  originalQueue.joinToString(",") { it.id.toString() })
-            .putInt("queue_index",  ps.queueIndex)
-            .putLong("position_ms", currentPosition())
-            .putString("repeat",    ps.repeatMode.name)
-            .putString("shuffle",   ps.shuffleMode.name)
-            .commit()   // synchronous — necessary when process may die immediately after
+        runBlocking(Dispatchers.IO) {
+            sessionDao.save(SessionEntity(
+                queueIds    = ps.queue.joinToString(",") { it.id.toString() },
+                origIds     = originalQueue.joinToString(",") { it.id.toString() },
+                queueIndex  = ps.queueIndex,
+                positionMs  = currentPosition(),
+                repeatMode  = ps.repeatMode.name,
+                shuffleMode = ps.shuffleMode.name
+            ))
+        }
     }
 
     // ── Internal command handlers ─────────────────────────────────────────────

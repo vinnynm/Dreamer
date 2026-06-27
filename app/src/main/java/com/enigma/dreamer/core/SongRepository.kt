@@ -3,19 +3,22 @@ package com.enigma.dreamer.core
 import android.content.ContentResolver
 import android.content.ContentUris
 import android.content.Context
-import android.os.Build
+import android.database.ContentObserver
+import android.os.Handler
+import android.os.Looper
 import android.provider.MediaStore
+import androidx.room.withTransaction
 import com.enigma.devlyric.core.LyricBaker
 import com.enigma.devlyric.core.LyricDocument
 import com.enigma.devlyric.core.LyricFormat
 import com.enigma.devlyric.core.LyricParser
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
-import androidx.room.withTransaction
 import java.io.File
-import androidx.core.net.toUri
 
 class SongRepository(private val context: Context) {
 
@@ -24,6 +27,8 @@ class SongRepository(private val context: Context) {
     private val playlistDao get() = db.playlistDao()
     private val favoriteDao get() = db.favoriteDao()
     private val songDao     get() = db.songDao()
+
+    @Volatile private var mediaStoreObserver: ContentObserver? = null
 
     // ── Fast cold-start path ──────────────────────────────────────────────────
 
@@ -50,6 +55,29 @@ class SongRepository(private val context: Context) {
         songDao.observeAll().map { entities ->
             entities.map { it.toSong() }
         }
+
+    fun observeMediaStoreChanges(): Flow<Unit> = callbackFlow {
+        val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
+            override fun onChange(selfChange: Boolean) {
+                trySend(Unit)
+            }
+        }
+        mediaStoreObserver = observer
+        contentResolver.registerContentObserver(
+            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+            /* notifyForDescendants = */ true,
+            observer
+        )
+        awaitClose {
+            contentResolver.unregisterContentObserver(observer)
+            mediaStoreObserver = null
+        }
+    }
+
+    fun unregisterMediaStoreObserver() {
+        mediaStoreObserver?.let { contentResolver.unregisterContentObserver(it) }
+        mediaStoreObserver = null
+    }
 
     /**
      * Full MediaStore scan — metadata only, no file reads.

@@ -121,28 +121,28 @@ interface FavoriteDao {
 
 // ── Database ──────────────────────────────────────────────────────────────────
 
+
 @Database(
     entities     = [
         PlaylistEntity::class,
         PlaylistSongCrossRef::class,
         FavoriteEntity::class,
-        SongEntity::class          // NEW in v3
+        SongEntity::class,
+        SessionEntity::class     // NEW in v4
     ],
-    version      = 3,
+    version      = 4,            // was 3
     exportSchema = false
 )
 abstract class DevLyricDatabase : RoomDatabase() {
     abstract fun playlistDao(): PlaylistDao
     abstract fun favoriteDao(): FavoriteDao
-    abstract fun songDao(): SongDao        // NEW in v3
+    abstract fun songDao(): SongDao
+    abstract fun sessionDao(): SessionDao   // NEW in v4
 
     companion object {
         @Volatile private var INSTANCE: DevLyricDatabase? = null
 
-        /**
-         * v1 → v2: playlists.id switched to autoGenerate.
-         * Clean slate — drops and recreates playlists + playlist_songs.
-         */
+        /** v1 → v2: recreate playlists + playlist_songs with autoGenerate PK. */
         private val MIGRATION_1_2 = object : Migration(1, 2) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("DROP TABLE IF EXISTS playlist_songs")
@@ -168,10 +168,7 @@ abstract class DevLyricDatabase : RoomDatabase() {
             }
         }
 
-        /**
-         * v2 → v3: adds the songs table for the MediaStore cache.
-         * No existing data is touched — playlists and favorites survive intact.
-         */
+        /** v2 → v3: adds songs table for MediaStore cache. */
         private val MIGRATION_2_3 = object : Migration(2, 3) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("""
@@ -192,12 +189,14 @@ abstract class DevLyricDatabase : RoomDatabase() {
                         hasLyricHint INTEGER NOT NULL DEFAULT 0
                     )
                 """.trimIndent())
-                // Index for the common sort order used in LibraryScreen
                 db.execSQL("CREATE INDEX IF NOT EXISTS index_songs_title ON songs(title ASC)")
                 db.execSQL("CREATE INDEX IF NOT EXISTS index_songs_artist ON songs(artist ASC)")
                 db.execSQL("CREATE INDEX IF NOT EXISTS index_songs_isFavorite ON songs(isFavorite)")
             }
         }
+
+        /** v3 → v4: adds session table for Room-backed playback session storage. */
+        private val MIGRATION_3_4 = MIGRATION_3_4_IMPL
 
         fun getInstance(context: Context): DevLyricDatabase =
             INSTANCE ?: synchronized(this) {
@@ -206,9 +205,36 @@ abstract class DevLyricDatabase : RoomDatabase() {
                     DevLyricDatabase::class.java,
                     "devlyric.db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
                     .build()
                     .also { INSTANCE = it }
             }
     }
 }
+
+
+/**
+ * v3 → v4: adds the [session] table for Room-backed playback session
+ * persistence (replaces SharedPreferences session storage).
+ *
+ * No existing data is touched — playlists, favorites, and the songs cache
+ * survive intact. The session table starts empty; MusicService will write
+ * to it the next time playback state changes.
+ */
+val MIGRATION_3_4_IMPL = object : Migration(3, 4) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("""
+            CREATE TABLE IF NOT EXISTS session (
+                id          INTEGER PRIMARY KEY NOT NULL DEFAULT 1,
+                queueIds    TEXT    NOT NULL DEFAULT '',
+                origIds     TEXT    NOT NULL DEFAULT '',
+                queueIndex  INTEGER NOT NULL DEFAULT -1,
+                positionMs  INTEGER NOT NULL DEFAULT 0,
+                repeatMode  TEXT    NOT NULL DEFAULT 'NONE',
+                shuffleMode TEXT    NOT NULL DEFAULT 'OFF',
+                savedAtMs   INTEGER NOT NULL DEFAULT 0
+            )
+        """.trimIndent())
+    }
+}
+
