@@ -68,8 +68,8 @@ fun PlaylistDetailScreen(
     val listState    = rememberLazyListState()
     val reorderState = rememberReorderableLazyListState(listState) { from, to ->
         val fromIndex = from.index - 1
-        val toIndex = to.index - 1
-        if (fromIndex >= 0 && toIndex >= 0) {
+        val toIndex   = to.index - 1
+        if (fromIndex >= 0 && toIndex >= 0 && fromIndex != toIndex) {
             items = items.toMutableList().apply { add(toIndex, removeAt(fromIndex)) }
         }
     }

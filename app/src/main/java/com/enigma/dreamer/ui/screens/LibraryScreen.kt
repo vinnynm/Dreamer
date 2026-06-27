@@ -489,7 +489,7 @@ fun SongsTab(
         items(songs, key = { it.id }, contentType = { "song" }) { song ->
             val favTint by animateColorAsState(
                 if (song.isFavorite) Amber else TextMuted,
-                label = "fav${song.id}"
+                label = "fav_tint"
             )
             SongListItem(
                 song        = song,

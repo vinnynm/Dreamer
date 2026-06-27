@@ -30,6 +30,8 @@ class LyricController(
     private val callbacks: Callbacks
 ) {
 
+    @Volatile private var loadingId: Long? = null
+
     interface Callbacks {
         /** Called on the main thread after lyrics are loaded for [song]. */
         fun onLyricsLoaded(song: Song, doc: LyricDocument)
@@ -44,11 +46,15 @@ class LyricController(
      * Calls [Callbacks.onLyricsLoaded] on the main thread when complete.
      */
     fun loadIfNeeded(song: Song) {
-        if (song.lyricDocument != null) return
+        if (song.lyricDocument != null || song.id == loadingId) return
+        loadingId = song.id
         scope.launch(Dispatchers.IO) {
-            val doc = repository.loadLyricsForSong(song) ?: return@launch
-            withContext(Dispatchers.Main) {
-                callbacks.onLyricsLoaded(song, doc)
+            val doc = repository.loadLyricsForSong(song)
+            loadingId = null
+            if (doc != null) {
+                withContext(Dispatchers.Main) {
+                    callbacks.onLyricsLoaded(song, doc)
+                }
             }
         }
     }

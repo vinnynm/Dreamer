@@ -1,6 +1,7 @@
 package com.enigma.dreamer.ui.components
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -214,10 +215,3 @@ fun EqSheet(
     }
 }
 
-// ── horizontalScroll extension helper (already in foundation, just for clarity)
-@Composable
-private fun Modifier.horizontalScroll(
-    state: androidx.compose.foundation.ScrollState
-): Modifier = this.then(
-    Modifier.horizontalScroll(state)
-)

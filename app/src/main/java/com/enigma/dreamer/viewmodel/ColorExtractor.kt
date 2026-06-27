@@ -42,15 +42,43 @@ class ColorExtractor(private val app: Application) {
         val bitmap = withTimeoutOrNull(2_000L) {
             artUri?.let { uri ->
                 runCatching {
-                    app.contentResolver
-                        .openInputStream(uri)
-                        ?.use { stream -> BitmapFactory.decodeStream(stream) }
+                    app.contentResolver.openInputStream(uri)?.use { stream ->
+                        // Two-pass decode: read bounds first, then decode at 1/4 scale
+                        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                        BitmapFactory.decodeStream(stream, null, bounds)
+
+                        // Re-open; can't reuse an exhausted InputStream
+                        app.contentResolver.openInputStream(uri)?.use { stream2 ->
+                            val opts = BitmapFactory.Options().apply {
+                                inSampleSize = calculateInSampleSize(bounds, 128, 128)
+                            }
+                            BitmapFactory.decodeStream(stream2, null, opts)
+                        }
+                    }
                 }.getOrNull()
             }
         }
 
         val dominant = if (bitmap != null) dominantColor(bitmap) else DEFAULT_BG
         Result(dominantColor = dominant, accentTextColor = contrastColor(dominant))
+    }
+
+    private fun calculateInSampleSize(
+        options: BitmapFactory.Options,
+        reqWidth: Int,
+        reqHeight: Int
+    ): Int {
+        var inSampleSize = 1
+        val (height, width) = options.outHeight to options.outWidth
+        if (height > reqHeight || width > reqWidth) {
+            val halfHeight = height / 2
+            val halfWidth  = width / 2
+            while (halfHeight / inSampleSize >= reqHeight &&
+                halfWidth  / inSampleSize >= reqWidth) {
+                inSampleSize *= 2
+            }
+        }
+        return inSampleSize
     }
 
     // ── Palette-based dominant color (FIX B-9) ────────────────────────────────

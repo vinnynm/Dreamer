@@ -96,10 +96,10 @@ fun QueueScreen(
             contentPadding = PaddingValues(vertical = 8.dp),
             modifier       = Modifier.fillMaxSize()
         ) {
-            itemsIndexed(items, key = { idx, song -> "${song.id}_$idx" }) { idx, song ->
+            itemsIndexed(items, key = { idx, _ -> idx }) { idx, song ->
                 val isCurrent = idx == currentIndex
 
-                ReorderableItem(reorderState, key = "${song.id}_$idx") { isDragging ->
+                ReorderableItem(reorderState, key = idx) { isDragging ->
                     val elevation by androidx.compose.animation.core.animateDpAsState(
                         if (isDragging) 8.dp else 0.dp,
                         label = "dragElevation"

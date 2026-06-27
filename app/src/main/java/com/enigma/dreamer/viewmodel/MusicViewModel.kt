@@ -125,6 +125,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 b.service.playbackState.collect { ps -> onPlaybackStateChanged(ps) }
             }
             startPositionTracking()
+            syncEqStateFromService()   // read initial EQ state once service is bound
             // FIX B-3: tryRestoreSession is NOT called here — loadAll() calls it
             // after songs are confirmed available, avoiding the cold-start race.
         }
@@ -163,7 +164,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     _uiState.value = MusicUiState.Ready
                     startObservers()
                     // FIX B-3
-                    playback.tryRestoreSession(cachedSongs)
+                    launch { playback.tryRestoreSession(cachedSongs) }
                 }
                 launchBackgroundScan(firstLaunch = cachedSongs.isEmpty(), playlists = playlists)
             } catch (e: Exception) {
@@ -193,7 +194,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                         )
                         _uiState.value = MusicUiState.Ready
                         startObservers()
-                        playback.tryRestoreSession(freshSongs)
+                        launch { playback.tryRestoreSession(freshSongs) }
                     } else {
                         mutateLibrary {
                             val lyricCache = songs
@@ -552,8 +553,9 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             while (true) {
                 delay(500)
                 val service = playback.service ?: continue
-                // FIX B-13: skip work when paused
-                if (!service.playbackState.value.isPlaying) continue
+                val pst      = service.playbackState.value
+                // FIX B-13: skip work when paused, UNLESS sleep timer is active (N-10)
+                if (!pst.isPlaying && !pst.sleepTimer.isActive) continue
 
                 val pos     = playback.currentPosition()
                 val lib     = _libraryState.value

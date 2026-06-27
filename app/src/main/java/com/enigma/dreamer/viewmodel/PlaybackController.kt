@@ -106,7 +106,7 @@ class PlaybackController {
 
     // ── Session ───────────────────────────────────────────────────────────────
 
-    fun tryRestoreSession(allSongs: List<Song>): Boolean =
+    suspend fun tryRestoreSession(allSongs: List<Song>): Boolean =
         service?.tryRestoreSession(allSongs) ?: false
 
     // ── Album art ─────────────────────────────────────────────────────────────

@@ -16,6 +16,7 @@ import com.google.common.util.concurrent.ListenableFuture
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import androidx.core.graphics.scale
+import androidx.core.graphics.toColorInt
 
 @OptIn(UnstableApi::class)
 class MusicService : MediaLibraryService() {
@@ -82,7 +83,7 @@ class MusicService : MediaLibraryService() {
 
         const val NOTIF_CHANNEL_ID     = "dreamer_playback"
 
-        private val COLOR_DEFAULT = Color.parseColor("#1A1A1A")
+        private val COLOR_DEFAULT = "#1A1A1A".toColorInt()
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -91,10 +92,14 @@ class MusicService : MediaLibraryService() {
         super.onCreate()
         createNotificationChannel()
         buildPlayer()
-        buildMediaSession()
-        observePlayerState()
+        // FIX: register notification provider BEFORE building the media session.
+        // If the provider is registered after, Media3 may have already attached its
+        // own default provider and our DreamerNotificationProvider is ignored on
+        // some OEM builds (observed on Samsung One UI and Xiaomi MIUI).
         notificationProvider = DreamerNotificationProvider(this, NOTIF_CHANNEL_ID)
         setMediaNotificationProvider(notificationProvider)
+        buildMediaSession()
+        observePlayerState()
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo) = mediaSession
@@ -128,11 +133,11 @@ class MusicService : MediaLibraryService() {
             val channel = NotificationChannel(
                 NOTIF_CHANNEL_ID,
                 "Now Playing",
-                NotificationManager.IMPORTANCE_LOW
+                NotificationManager.IMPORTANCE_DEFAULT   // was IMPORTANCE_LOW
             ).apply {
                 description          = "Shows the currently playing song with transport controls"
                 lockscreenVisibility = Notification.VISIBILITY_PUBLIC
-                setShowBadge(false)
+                // Removed setShowBadge(false) — badge helps discoverability
             }
             getSystemService(NotificationManager::class.java)
                 ?.createNotificationChannel(channel)
@@ -301,6 +306,8 @@ class MusicService : MediaLibraryService() {
                 queue.zip(originalQueue).all { (a, b) -> a.id == b.id }
 
         if (isSameQueue) {
+            // Update queue reference so updated Song fields (favorites, lyrics) are visible
+            _playbackState.value = _playbackState.value.copy(queue = queue)
             val song = queue.getOrNull(index)
             val effectiveIdx = if (ps.shuffleMode == ShuffleMode.ON) {
                 ps.queue.indexOfFirst { it.id == song?.id }.coerceAtLeast(0)
@@ -451,14 +458,11 @@ class MusicService : MediaLibraryService() {
 
     // ── Session restore ───────────────────────────────────────────────────────
 
-    fun tryRestoreSession(allSongs: List<Song>): Boolean {
+    suspend fun tryRestoreSession(allSongs: List<Song>): Boolean {
         if (sessionRestored) return false
         sessionRestored = true
 
-        // Read from Room synchronously (called from the service's coroutine
-        // scope once songs are available; using runBlocking here to keep the
-        // existing synchronous caller signature intact).
-        val session = runBlocking(Dispatchers.IO) { sessionDao.get() }
+        val session = withContext(Dispatchers.IO) { sessionDao.get() }
             ?: return false
 
         val idx         = session.queueIndex
@@ -500,13 +504,18 @@ class MusicService : MediaLibraryService() {
     // ── Persistence ───────────────────────────────────────────────────────────
 
     private fun persistState() {
-        val ps = _playbackState.value
+        val ps  = _playbackState.value
+        // Capture position on the main thread BEFORE switching to IO dispatcher.
+        // ExoPlayer enforces that currentPosition() is only called on the thread
+        // that owns the player (main thread). runBlocking(Dispatchers.IO) would
+        // move execution to a worker thread before the position is read — crash.
+        val pos = try { player.currentPosition } catch (_: Exception) { ps.positionMs }
         serviceScope.launch(Dispatchers.IO) {
             sessionDao.save(SessionEntity(
                 queueIds    = ps.queue.joinToString(",") { it.id.toString() },
                 origIds     = originalQueue.joinToString(",") { it.id.toString() },
                 queueIndex  = ps.queueIndex,
-                positionMs  = currentPosition(),
+                positionMs  = pos,
                 repeatMode  = ps.repeatMode.name,
                 shuffleMode = ps.shuffleMode.name
             ))
@@ -514,16 +523,20 @@ class MusicService : MediaLibraryService() {
     }
 
     private fun persistStateSync() {
-        val ps = _playbackState.value
-        runBlocking(Dispatchers.IO) {
-            sessionDao.save(SessionEntity(
-                queueIds    = ps.queue.joinToString(",") { it.id.toString() },
-                origIds     = originalQueue.joinToString(",") { it.id.toString() },
-                queueIndex  = ps.queueIndex,
-                positionMs  = currentPosition(),
-                repeatMode  = ps.repeatMode.name,
-                shuffleMode = ps.shuffleMode.name
-            ))
+        val ps  = _playbackState.value
+        // Same fix: read position on main thread, pass as plain Long to IO block.
+        val pos = try { player.currentPosition } catch (_: Exception) { ps.positionMs }
+        runBlocking {
+            withContext(NonCancellable + Dispatchers.IO) {
+                sessionDao.save(SessionEntity(
+                    queueIds    = ps.queue.joinToString(",") { it.id.toString() },
+                    origIds     = originalQueue.joinToString(",") { it.id.toString() },
+                    queueIndex  = ps.queueIndex,
+                    positionMs  = pos,
+                    repeatMode  = ps.repeatMode.name,
+                    shuffleMode = ps.shuffleMode.name
+                ))
+            }
         }
     }
 
@@ -611,16 +624,17 @@ class MusicService : MediaLibraryService() {
     }
 
     fun reorderQueue(newQueue: List<Song>) {
-    originalQueue = newQueue
-     val currentId = _playbackState.value.currentSong?.id
-    val newIndex  = newQueue.indexOfFirst { it.id == currentId }.coerceAtLeast(0)
-     player.setMediaItems(newQueue.map { it.toMediaItem() }, newIndex,
-                          player.currentPosition)
-     _playbackState.value = _playbackState.value.copy(
-        queue = newQueue, queueIndex = newIndex
-    )
-     persistState()
- }
+        originalQueue  = newQueue
+        val currentId  = _playbackState.value.currentSong?.id
+        val newIndex   = newQueue.indexOfFirst { it.id == currentId }.coerceAtLeast(0)
+        val savedPos   = player.currentPosition                          // capture FIRST
+        player.setMediaItems(newQueue.map { it.toMediaItem() }, newIndex, savedPos)
+        _playbackState.value = _playbackState.value.copy(
+            queue      = newQueue,
+            queueIndex = newIndex
+        )
+        persistState()
+    }
 
 
 
