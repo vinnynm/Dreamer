@@ -91,8 +91,8 @@ class MusicService : MediaLibraryService() {
         createNotificationChannel()
         buildPlayer()
         notificationProvider = DreamerNotificationProvider(this, NOTIF_CHANNEL_ID)
-        setMediaNotificationProvider(notificationProvider)
-        buildMediaSession()
+        setMediaNotificationProvider(notificationProvider)   // ← must be BEFORE buildMediaSession
+        buildMediaSession()                                  // ← session captures provider here
         observePlayerState()
     }
 
@@ -126,10 +126,11 @@ class MusicService : MediaLibraryService() {
             val channel = NotificationChannel(
                 NOTIF_CHANNEL_ID,
                 "Now Playing",
-                NotificationManager.IMPORTANCE_DEFAULT
+                NotificationManager.IMPORTANCE_LOW          // ← was IMPORTANCE_DEFAULT
             ).apply {
                 description          = "Shows the currently playing song with transport controls"
                 lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+                setShowBadge(false)                         // media channels don't need app badges
             }
             getSystemService(NotificationManager::class.java)
                 ?.createNotificationChannel(channel)

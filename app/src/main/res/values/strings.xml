@@ -1,4 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    ADD the following entry to res/values/strings.xml.
+
+    This resource is referenced by DreamerNotificationProvider:
+        com.enigma.dreamer.R.string.notification_channel_name
+
+    If this string is missing, the parent DefaultMediaNotificationProvider
+    constructor throws a Resources.NotFoundException when MusicService starts,
+    which crashes the service before it can post any notification.
+
+    The fix in DreamerNotificationProvider (Phase 5) correctly references this
+    resource — it just has to actually exist in strings.xml.
+-->
 <resources>
+    <!-- App name — keep whatever you already have -->
     <string name="app_name">Dreamer</string>
+
+    <!--
+        REQUIRED by DreamerNotificationProvider constructor.
+        DefaultMediaNotificationProvider calls context.getString(channelNameRes)
+        to set the channel name; passing 0 or a missing res ID crashes on OEM builds.
+    -->
     <string name="notification_channel_name">Now Playing</string>
 </resources>
+
+    <!--
+        If you already have a strings.xml, just ADD this single line anywhere in <resources>:
+
+            <string name="notification_channel_name">Now Playing</string>
+    -->
