@@ -29,6 +29,7 @@ import kotlinx.serialization.Serializable
 import com.enigma.dreamer.ui.screens.LibraryScreen
 import com.enigma.dreamer.ui.screens.LyricEditorScreen
 import com.enigma.dreamer.ui.screens.NowPlayingScreen
+import com.enigma.dreamer.ui.screens.NowPlayingScreenWithPredictiveBack
 import com.enigma.dreamer.ui.screens.PlaylistDetailScreen
 import com.enigma.dreamer.ui.screens.SettingsScreen
 import com.enigma.dreamer.ui.theme.*
@@ -100,14 +101,20 @@ class MainActivity : ComponentActivity() {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 // API 33+: granular media permission replaces READ_EXTERNAL_STORAGE
                 add(Manifest.permission.READ_MEDIA_AUDIO)
+                add(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED)
                 add(Manifest.permission.POST_NOTIFICATIONS)
+                add(Manifest.permission.READ_MEDIA_IMAGES)
             } else {
                 add(Manifest.permission.READ_EXTERNAL_STORAGE)
+                add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+
             }
             // WRITE needed to bake lyrics into audio files on API 28 and below.
             // On API 29+ MediaStore write-with-URI is used; no manifest permission needed.
             if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
                 add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                add(Manifest.permission.READ_EXTERNAL_STORAGE)
+
             }
             // DO NOT add FOREGROUND_SERVICE or FOREGROUND_SERVICE_MEDIA_PLAYBACK here.
             // Those are declared in AndroidManifest.xml and granted automatically at install.

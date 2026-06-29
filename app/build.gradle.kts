@@ -101,4 +101,14 @@ dependencies {
     // ── Reorderable List ──────────────────────────────────────────────────────
     implementation("sh.calvin.reorderable:reorderable:3.1.0")
     implementation(kotlin("test"))
+
+    // 2. Android Legacy Media Support (Provides MediaBrowserServiceCompat, MediaSessionCompat)
+    implementation("androidx.media:media:1.8.0")
+
+    // 3. Kotlin Coroutines (Provides CoroutineScope, Dispatchers.IO, launch)
+    val coroutinesVersion = "1.11.0"
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:$coroutinesVersion")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:$coroutinesVersion")
+
+
 }

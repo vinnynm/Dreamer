@@ -15,6 +15,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontFamily
@@ -56,7 +57,9 @@ fun LyricEditorScreen(
     isSaving: Boolean = false,
     saveMessage: String? = null
 ) {
-    val clipboardManager = LocalClipboardManager.current
+    val clipboardManager = LocalClipboard.current
+
+
 
     // ── Editor state ──────────────────────────────────────────────────────────
 
@@ -325,7 +328,7 @@ fun LyricEditorScreen(
                         },
                         // 8.4: clipboard import handler
                         onImportFromClipboard = {
-                            val text = clipboardManager.getText()?.text
+                            val text = clipboardManager.nativeClipboard.text.toString()
                             if (!text.isNullOrBlank()) {
                                 rawText = TextFieldValue(text)
                                 showPastedBanner = true

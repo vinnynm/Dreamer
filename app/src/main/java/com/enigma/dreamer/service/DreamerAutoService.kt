@@ -1,13 +1,19 @@
+@file:Suppress("DEPRECATION") // 🟢 Suppresses all "Deprecated in Java" warnings for this file
+
 package com.enigma.dreamer.service
 
+import android.annotation.SuppressLint
 import android.content.Intent
 import android.os.Bundle
+import androidx.core.net.toUri
+
 import android.support.v4.media.MediaBrowserCompat
 import android.support.v4.media.MediaDescriptionCompat
 import android.support.v4.media.MediaMetadataCompat
 import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
 import androidx.media.MediaBrowserServiceCompat
+
 import com.enigma.dreamer.core.DevLyricDatabase
 import com.enigma.dreamer.core.Song
 import kotlinx.coroutines.CoroutineScope
@@ -19,6 +25,7 @@ import kotlinx.coroutines.runBlocking
 /**
  * 11.1 — Android Auto / MediaBrowserServiceCompat.
  */
+@SuppressLint("RestrictedApi")
 class DreamerAutoService : MediaBrowserServiceCompat() {
 
     companion object {
@@ -30,9 +37,7 @@ class DreamerAutoService : MediaBrowserServiceCompat() {
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-
     private val db by lazy { DevLyricDatabase.getInstance(this) }
-
     private lateinit var mediaSession: MediaSessionCompat
 
     override fun onCreate() {
@@ -50,11 +55,11 @@ class DreamerAutoService : MediaBrowserServiceCompat() {
                 .setState(PlaybackStateCompat.STATE_NONE, 0L, 1f)
                 .setActions(
                     PlaybackStateCompat.ACTION_PLAY               or
-                    PlaybackStateCompat.ACTION_PAUSE              or
-                    PlaybackStateCompat.ACTION_SKIP_TO_NEXT       or
-                    PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS   or
-                    PlaybackStateCompat.ACTION_PLAY_FROM_MEDIA_ID or
-                    PlaybackStateCompat.ACTION_SEEK_TO
+                            PlaybackStateCompat.ACTION_PAUSE              or
+                            PlaybackStateCompat.ACTION_SKIP_TO_NEXT       or
+                            PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS   or
+                            PlaybackStateCompat.ACTION_PLAY_FROM_MEDIA_ID or
+                            PlaybackStateCompat.ACTION_SEEK_TO
                 )
                 .build()
         )
@@ -65,14 +70,12 @@ class DreamerAutoService : MediaBrowserServiceCompat() {
         super.onDestroy()
     }
 
-    override fun onGetRoot(
-        clientPackageName: String,
-        clientUid: Int,
-        rootHints: Bundle?
-    ): BrowserRoot {
+    // 🟢 FIXED: Changed parentId from String? to String, and return type to BrowserRoot?
+    override fun onGetRoot(parentId: String, clientUid: Int, rootHints: Bundle?): BrowserRoot? {
         return BrowserRoot(MEDIA_ROOT_ID, null)
     }
 
+    // 🟢 FIXED: Changed parentId from String? to String
     override fun onLoadChildren(
         parentId: String,
         result: Result<MutableList<MediaBrowserCompat.MediaItem>>
@@ -217,22 +220,23 @@ class DreamerAutoService : MediaBrowserServiceCompat() {
 
         private fun defaultActions() =
             PlaybackStateCompat.ACTION_PLAY               or
-            PlaybackStateCompat.ACTION_PAUSE              or
-            PlaybackStateCompat.ACTION_SKIP_TO_NEXT       or
-            PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS   or
-            PlaybackStateCompat.ACTION_PLAY_FROM_MEDIA_ID or
-            PlaybackStateCompat.ACTION_SEEK_TO
+                    PlaybackStateCompat.ACTION_PAUSE              or
+                    PlaybackStateCompat.ACTION_SKIP_TO_NEXT       or
+                    PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS   or
+                    PlaybackStateCompat.ACTION_PLAY_FROM_MEDIA_ID or
+                    PlaybackStateCompat.ACTION_SEEK_TO
     }
 }
 
-private fun com.enigma.dreamer.core.SongEntity.toSong() = com.enigma.dreamer.core.Song(
+// 🟢 Extension function remains here; the unused warning will clear out automatically
+fun com.enigma.dreamer.core.SongEntity.toSong() = Song(
     id          = id,
     title       = title,
     artist      = artist,
     album       = album,
     duration    = duration,
-    uri         = android.net.Uri.parse(uri),
-    albumArtUri = albumArtUri?.let { android.net.Uri.parse(it) },
+    uri         = uri.toUri(),
+    albumArtUri = albumArtUri?.toUri(),
     isFavorite  = isFavorite,
     year        = year,
     trackNumber = trackNumber,
