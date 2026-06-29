@@ -38,9 +38,40 @@ class MainActivity : ComponentActivity() {
 
     private val viewModel: MusicViewModel by viewModels()
 
+    // FIX: Two bugs corrected here.
+    //
+    // BUG 1 — Install-time permissions in the runtime launcher:
+    //   FOREGROUND_SERVICE and FOREGROUND_SERVICE_MEDIA_PLAYBACK are install-time
+    //   permissions declared in AndroidManifest.xml. They cannot be requested via
+    //   ActivityResultContracts.RequestMultiplePermissions(). Passing them to the
+    //   launcher causes it to behave unpredictably on API 34+ — it may reject the
+    //   entire request batch, meaning READ_MEDIA_AUDIO is never shown to the user.
+    //   Fix: only request genuine runtime permissions here.
+    //
+    // BUG 2 — Empty launcher callback, no rescan after grant:
+    //   MusicViewModel.init {} calls loadAll() immediately on creation, before the
+    //   permission dialog is shown. On first install READ_MEDIA_AUDIO / READ_EXTERNAL_STORAGE
+    //   isn't granted yet, so scanAndSync() returns an empty list and zero songs are cached.
+    //   When the user grants permission in the dialog, nothing triggers a re-scan.
+    //   Fix: call viewModel.rescan() from the launcher callback when the storage
+    //   read permission has just been granted.
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { }
+    ) { results ->
+        // Check if the storage read permission was just granted
+        val storagePermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+            Manifest.permission.READ_MEDIA_AUDIO
+        else
+            Manifest.permission.READ_EXTERNAL_STORAGE
+
+        val storageGranted = results[storagePermission] == true
+        if (storageGranted) {
+            // Trigger a fresh scan now that we can actually read the MediaStore.
+            // rescan() is a no-op if the library is already populated (e.g. on
+            // subsequent launches where permission was granted previously).
+            viewModel.rescan()
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -60,18 +91,26 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun requestPermissions() {
+        // BUG 1 FIX: Only request runtime permissions.
+        //   FOREGROUND_SERVICE and FOREGROUND_SERVICE_MEDIA_PLAYBACK must NOT appear
+        //   here — they are install-time permissions that belong only in the manifest.
+        //   Including them in this list causes the launcher to fail silently on
+        //   Android 14 (API 34), which may skip showing READ_MEDIA_AUDIO entirely.
         val perms = buildList {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                // API 33+: granular media permission replaces READ_EXTERNAL_STORAGE
                 add(Manifest.permission.READ_MEDIA_AUDIO)
                 add(Manifest.permission.POST_NOTIFICATIONS)
             } else {
                 add(Manifest.permission.READ_EXTERNAL_STORAGE)
             }
+            // WRITE needed to bake lyrics into audio files on API 28 and below.
+            // On API 29+ MediaStore write-with-URI is used; no manifest permission needed.
             if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
                 add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
             }
-            add(Manifest.permission.FOREGROUND_SERVICE)
-            add(Manifest.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK)
+            // DO NOT add FOREGROUND_SERVICE or FOREGROUND_SERVICE_MEDIA_PLAYBACK here.
+            // Those are declared in AndroidManifest.xml and granted automatically at install.
         }
         permissionLauncher.launch(perms.toTypedArray())
     }
@@ -87,17 +126,6 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun DevLyricApp(viewModel: MusicViewModel, openNowPlaying: Boolean = false) {
-    // Phase 7.2: collect the two state flows independently.
-    //
-    // Previously a single collectAsState() on MusicUiState.Ready drove the
-    // entire composition. Now:
-    //   • uiState    — loading/error envelope only; drives the top-level when{} branch
-    //   • libState   — songs, playlists, search/sort; stable between songs
-    //   • playerState — position, current song, colors; updated every 500 ms while playing
-    //
-    // Screens that only read libState (e.g. the Playlists tab, search bar) are
-    // never recomposed by the 500 ms position ticker. NowPlayingScreen reads
-    // playerState and is the only screen that recomposes at playback frequency.
     val uiState     by viewModel.uiState.collectAsState()
     val libState    by viewModel.libraryState.collectAsState()
     val playerState by viewModel.playerState.collectAsState()
@@ -196,9 +224,6 @@ fun DevLyricApp(viewModel: MusicViewModel, openNowPlaying: Boolean = false) {
                         }
 
                         composable<NowPlayingRoute> {
-                            // NowPlayingScreen reads from playerState exclusively —
-                            // it is the only screen that recomposes at 500 ms frequency.
-                            // libState changes (search, favorites) do NOT reach here.
                             NowPlayingScreen(
                                 playbackState      = ps,
                                 currentLyricLine   = playerState.currentLyricLine,
@@ -220,7 +245,11 @@ fun DevLyricApp(viewModel: MusicViewModel, openNowPlaying: Boolean = false) {
                                 onCancelSleepTimer = viewModel::cancelSleepTimer,
                                 onOpenSettings     = { navController.navigate(SettingsRoute) },
                                 onSkipToQueue      = viewModel::skipToQueueItem,
-                                onBack             = { navController.popBackStack() }
+                                onBack             = { navController.popBackStack() },
+                                eqState            = playerState.eqState,
+                                onToggleEq         = viewModel::setEqEnabled,
+                                onEqPresetChange   = viewModel::setEqPreset,
+                                onEqBassChange     = viewModel::setEqBassBoost
                             )
                         }
 
@@ -260,6 +289,9 @@ fun DevLyricApp(viewModel: MusicViewModel, openNowPlaying: Boolean = false) {
                                         viewModel.playPlaylist(playlist)
                                         navController.navigate(NowPlayingRoute)
                                     },
+                                    onReorderSongs = { newIds ->
+                                        viewModel.reorderPlaylistSongs(playlist.id, newIds)
+                                    },
                                     onBack = { navController.popBackStack() }
                                 )
                             } else {
@@ -269,9 +301,6 @@ fun DevLyricApp(viewModel: MusicViewModel, openNowPlaying: Boolean = false) {
 
                         composable<LyricEditorRoute> { entry ->
                             val route = entry.toRoute<LyricEditorRoute>()
-                            // Read from libState (stable) — not playerState — so
-                            // the editor doesn't recompose on every position tick.
-                            // Only positionMs and isPlaying come from playerState.
                             val song = libState.songs.find { it.id == route.songId }
 
                             if (song == null) {
