@@ -119,11 +119,9 @@ data class PlayerState(
     val showLyrics: Boolean = false,
     val showQueue: Boolean = false,
     val dominantColor: Int = 0xFF0D0D0D.toInt(),
-    val accentTextColor: Int = 0xFFEEEEEE.toInt(),
-    // 8.8: EQ / bass boost state — carried in PlayerState so NowPlayingScreen
-    // can drive the EQ sheet without a separate StateFlow. The ViewModel
-    // mutates this whenever the user changes EQ settings via the options menu.
-    val eqState: EqState = EqState()
+    val accentTextColor: Int            = 0xFFEEEEEE.toInt(),
+    val eqState:         EqState        = EqState(),
+    val pitchSemitones:  Int            = 0
 )
 
 /**

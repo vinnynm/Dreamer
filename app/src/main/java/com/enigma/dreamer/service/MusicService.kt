@@ -42,6 +42,7 @@ class MusicService : MediaLibraryService() {
     private var originalQueue: List<Song> = emptyList()
 
     @Volatile private var sessionRestored = false
+    @Volatile private var currentPitch: Float = 1.0f
 
     // ── Core objects ──────────────────────────────────────────────────────────
 
@@ -94,6 +95,23 @@ class MusicService : MediaLibraryService() {
         setMediaNotificationProvider(notificationProvider)   // ← must be BEFORE buildMediaSession
         buildMediaSession()                                  // ← session captures provider here
         observePlayerState()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            "cmd_play"         -> play()
+            "cmd_pause"        -> pause()
+            "cmd_next"         -> next()
+            "cmd_previous"     -> previous()
+            "cmd_play_pause"   -> togglePlayPauseInternal()
+            "cmd_seek"         -> seekTo(intent.getLongExtra("seek_pos_ms", 0L))
+            "cmd_play_from_id" -> {
+                val songId = intent.getLongExtra("song_id", -1L)
+                val idx = _playbackState.value.queue.indexOfFirst { it.id == songId }
+                if (idx >= 0) { player.seekTo(idx, 0L); player.play() }
+            }
+        }
+        return super.onStartCommand(intent, flags, startId)
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo) = mediaSession
@@ -228,6 +246,7 @@ class MusicService : MediaLibraryService() {
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 _playbackState.value = _playbackState.value.copy(isPlaying = isPlaying)
+                pushWidgetUpdate()
                 persistState()
             }
 
@@ -244,6 +263,7 @@ class MusicService : MediaLibraryService() {
                 albumArtBitmap = null
                 bmp?.recycle()
                 notificationProvider.setAccentColor(COLOR_DEFAULT)
+                pushWidgetUpdate()
                 persistState()
             }
 
@@ -390,9 +410,15 @@ class MusicService : MediaLibraryService() {
 
     fun setPlaybackSpeed(speed: Float) {
         val clamped = speed.coerceIn(0.25f, 3.0f)
-        player.setPlaybackParameters(PlaybackParameters(clamped))
+        player.setPlaybackParameters(PlaybackParameters(clamped, currentPitch))
         _playbackState.value = _playbackState.value.copy(playbackSpeed = clamped)
         persistState()
+    }
+
+    fun setPitch(pitch: Float) {
+        currentPitch = pitch.coerceIn(0.25f, 4.0f)
+        val speed    = _playbackState.value.playbackSpeed
+        player.setPlaybackParameters(PlaybackParameters(speed, currentPitch))
     }
 
     fun startSleepTimer(delayMs: Long) {
@@ -547,6 +573,10 @@ class MusicService : MediaLibraryService() {
 
     // ── Internal command handlers ─────────────────────────────────────────────
 
+    private fun togglePlayPauseInternal() {
+        if (player.isPlaying) pause() else play()
+    }
+
     private fun toggleShuffleInternal() =
         setShuffleMode(
             if (_playbackState.value.shuffleMode == ShuffleMode.OFF) ShuffleMode.ON else ShuffleMode.OFF
@@ -626,6 +656,19 @@ class MusicService : MediaLibraryService() {
         val out = java.io.ByteArrayOutputStream()
         bmp.compress(Bitmap.CompressFormat.JPEG, 85, out)
         return out.toByteArray()
+    }
+
+    private fun pushWidgetUpdate() {
+        val ps   = _playbackState.value
+        val song = ps.currentSong ?: return
+        com.enigma.dreamer.widget.DreamerWidget.push(
+            context   = this,
+            title     = song.title,
+            artist    = song.artist,
+            isPlaying = ps.isPlaying,
+            progress  = ps.progress,
+            artUri    = song.albumArtUri
+        )
     }
 
     // ── EQ public API ─────────────────────────────────────────────────────────

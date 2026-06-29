@@ -92,6 +92,11 @@ class PlaybackController {
         return true
     }
 
+    fun setPitch(pitch: Float): Boolean {
+        service?.setPitch(pitch) ?: return false
+        return true
+    }
+
     // ── Sleep timer ───────────────────────────────────────────────────────────
 
     fun startSleepTimer(delayMs: Long): Boolean {
