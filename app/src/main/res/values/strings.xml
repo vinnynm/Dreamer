@@ -22,6 +22,7 @@
         to set the channel name; passing 0 or a missing res ID crashes on OEM builds.
     -->
     <string name="notification_channel_name">Now Playing</string>
+    <string name="widget_description">Now Playing controls for Dreamer</string>
 </resources>
 
     <!--

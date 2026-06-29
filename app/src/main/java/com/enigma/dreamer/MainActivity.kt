@@ -224,7 +224,7 @@ fun DevLyricApp(viewModel: MusicViewModel, openNowPlaying: Boolean = false) {
                         }
 
                         composable<NowPlayingRoute> {
-                            NowPlayingScreen(
+                            NowPlayingScreenWithPredictiveBack(
                                 playbackState      = ps,
                                 currentLyricLine   = playerState.currentLyricLine,
                                 showLyrics         = playerState.showLyrics,
@@ -249,7 +249,9 @@ fun DevLyricApp(viewModel: MusicViewModel, openNowPlaying: Boolean = false) {
                                 eqState            = playerState.eqState,
                                 onToggleEq         = viewModel::setEqEnabled,
                                 onEqPresetChange   = viewModel::setEqPreset,
-                                onEqBassChange     = viewModel::setEqBassBoost
+                                onEqBassChange     = viewModel::setEqBassBoost,
+                                pitchSemitones     = playerState.pitchSemitones,
+                                onSetPitch         = viewModel::setPitch
                             )
                         }
 

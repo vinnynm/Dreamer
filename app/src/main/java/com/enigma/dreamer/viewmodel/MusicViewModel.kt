@@ -63,6 +63,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     /** Derives dominant + contrast colors from album art bitmaps. */
     private val colorExtractor = ColorExtractor(application)
 
+    private val pitchController = PitchController()
+
     /**
      * Lazy lyric loader + line tracker.
      * Implements [LyricController.Callbacks] anonymously so the controller
@@ -361,6 +363,11 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     fun setPlaybackSpeed(speed: Float) {
         playback.setPlaybackSpeed(speed)
         mutatePlayer { copy(playbackState = playbackState.copy(playbackSpeed = speed)) }
+    }
+
+    fun setPitch(semitones: Int) {
+        pitchController.set(semitones, playback.service)
+        mutatePlayer { copy(pitchSemitones = semitones) }
     }
 
     // ── Queue ─────────────────────────────────────────────────────────────────

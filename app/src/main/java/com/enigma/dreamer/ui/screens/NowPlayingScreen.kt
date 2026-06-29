@@ -46,12 +46,14 @@ import com.enigma.dreamer.ui.theme.*
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun NowPlayingScreen(
+    modifier: Modifier = Modifier,
     playbackState: PlaybackState,
     currentLyricLine: Int,
     showLyrics: Boolean,
     showQueue: Boolean,
     dominantColor: Int = 0xFF0D0D0D.toInt(),
     accentTextColor: Int = 0xFFEEEEEE.toInt(),
+    pitchSemitones: Int = 0,
     onPlayPause: () -> Unit,
     onNext: () -> Unit,
     onPrevious: () -> Unit,
@@ -67,6 +69,7 @@ fun NowPlayingScreen(
     onOpenSettings: () -> Unit,
     onBack: () -> Unit,
     onSkipToQueue: (Int) -> Unit,
+    onSetPitch: (Int) -> Unit = {},
     // 8.8: EQ state + callbacks
     eqState: EqState = EqState(),
     onToggleEq: (Boolean) -> Unit = {},
@@ -95,6 +98,7 @@ fun NowPlayingScreen(
     var showOptionsMenu by remember { mutableStateOf(false) }
     // 8.8: EQ sheet toggle
     var showEqSheet by remember { mutableStateOf(false) }
+    var showPitchSheet by remember { mutableStateOf(false) }
 
     LaunchedEffect(currentLyricLine) {
         if (showLyrics && currentLyricLine >= 0) {
@@ -106,7 +110,7 @@ fun NowPlayingScreen(
         playbackState.queue.getOrNull(playbackState.queueIndex + 1)
     }
 
-    Box(modifier = Modifier.fillMaxSize()) {
+    Box(modifier = modifier.fillMaxSize()) {
 
         // ── Layer 1: blurred album art atmosphere ─────────────────────────────
         // 8.7: Crossfade album art on song transition using Coil's crossfade(true)
@@ -226,7 +230,9 @@ fun NowPlayingScreen(
                             onStartSleepTimer   = { onStartSleepTimer(it); showOptionsMenu = false },
                             onCancelSleepTimer  = { onCancelSleepTimer(); showOptionsMenu = false },
                             // 8.8
-                            onOpenEq            = { showEqSheet = true; showOptionsMenu = false }
+                            onOpenEq            = { showEqSheet = true; showOptionsMenu = false },
+                            pitchSemitones      = pitchSemitones,
+                            onOpenPitch         = { showPitchSheet = true; showOptionsMenu = false }
                         )
                     }
                 }
@@ -483,6 +489,14 @@ fun NowPlayingScreen(
             onBassChange   = onEqBassChange
         )
     }
+
+    if (showPitchSheet) {
+        com.enigma.dreamer.ui.components.PitchSheet(
+            semitones  = pitchSemitones,
+            onDismiss  = { showPitchSheet = false },
+            onSetPitch = { onSetPitch(it) }
+        )
+    }
 }
 
 // ── Empty state — FIX B-2 ────────────────────────────────────────────────────
@@ -647,7 +661,9 @@ private fun OptionsDropdown(
     onSpeedChange: (Float) -> Unit,
     onStartSleepTimer: (Int) -> Unit,
     onCancelSleepTimer: () -> Unit,
-    onOpenEq: () -> Unit          // 8.8
+    onOpenEq: () -> Unit,
+    pitchSemitones: Int,
+    onOpenPitch: () -> Unit
 ) {
     DropdownMenu(
         expanded         = expanded,
@@ -668,6 +684,25 @@ private fun OptionsDropdown(
                 }
             },
             onClick = onOpenEq
+        )
+
+        DropdownMenuItem(
+            text = {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment     = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Filled.MusicNote, null,
+                        tint = if (pitchSemitones != 0) Amber else TextSecondary,
+                        modifier = Modifier.size(16.dp))
+                    Text(
+                        if (pitchSemitones != 0) "Pitch (${if (pitchSemitones > 0) "+$pitchSemitones" else "$pitchSemitones"} st)" else "Pitch",
+                        color = TextPrimary,
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                }
+            },
+            onClick = onOpenPitch
         )
 
         HorizontalDivider(color = Surface3, modifier = Modifier.padding(vertical = 4.dp))
