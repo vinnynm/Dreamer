@@ -21,6 +21,9 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"
         tools:ignore="ForegroundServicesPolicy" />
 
+    <!-- Restore service on device boot -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
@@ -47,6 +50,7 @@
         android:name=".DreamerApplication"
         android:allowBackup="true"
         android:label="@string/app_name"
+        android:enableOnBackInvokedCallback="true"
         android:theme="@style/Theme.Dreamer">
 
         <activity
@@ -94,6 +98,34 @@
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
+
+        <receiver
+            android:name=".widget.DreamerWidget"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                <action android:name="com.enigma.dreamer.WIDGET_UPDATE" />
+                <action android:name="com.enigma.dreamer.WIDGET_PLAY_PAUSE" />
+                <action android:name="com.enigma.dreamer.WIDGET_NEXT" />
+                <action android:name="com.enigma.dreamer.WIDGET_PREVIOUS" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/dreamer_widget_info" />
+        </receiver>
+
+        <service
+            android:name=".service.DreamerAutoService"
+            android:exported="true"
+            android:permission="android.permission.BIND_MEDIA_BROWSER_SERVICE">
+            <intent-filter>
+                <action android:name="android.media.browse.MediaBrowserService" />
+            </intent-filter>
+        </service>
+
+        <meta-data
+            android:name="com.google.android.gms.car.application"
+            android:resource="@xml/automotive_app_desc" />
 
     </application>
 </manifest>
