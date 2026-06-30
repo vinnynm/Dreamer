@@ -118,10 +118,12 @@ fun NowPlayingScreen(
         // crossfade request whenever the song changes, rather than abruptly
         // swapping the bitmap in-place. The key() forces Compose to dispose and
         // re-compose the AsyncImage for each new song.
+        /**
         key(song.id) {
             AsyncImage(
                 model = ImageRequest.Builder(LocalContext.current)
                     .data(song.albumArtUri)
+                    .allowHardware(false)
                     .crossfade(600)                // 600 ms crossfade (8.7)
                     .placeholder(R.drawable.ic_default_album_art)
                     .error(R.drawable.ic_default_album_art)
@@ -133,6 +135,7 @@ fun NowPlayingScreen(
                     .blur(60.dp)
             )
         }
+        */
 
         // ── Layer 2: dominant-color gradient overlay ──────────────────────────
         Box(
@@ -439,6 +442,8 @@ fun NowPlayingScreen(
                                     AsyncImage(
                                         model = ImageRequest.Builder(LocalContext.current)
                                             .data(next.albumArtUri)
+                                            .allowHardware(false)
+                                            .allowHardware(false)
                                             .crossfade(400)
                                             .placeholder(R.drawable.ic_default_album_art)
                                             .error(R.drawable.ic_default_album_art)
@@ -621,6 +626,7 @@ private fun VinylDisc(
                     model = ImageRequest.Builder(LocalContext.current)
                         .data(song.albumArtUri)
                         .crossfade(600)
+                        .allowHardware(false)
                         .placeholder(R.drawable.ic_default_album_art)
                         .error(R.drawable.ic_default_album_art)
                         .build(),

@@ -15,6 +15,7 @@ import com.enigma.dreamer.core.*
 import com.enigma.dreamer.domain.usecase.*
 import com.enigma.dreamer.service.MusicService
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
@@ -267,6 +268,15 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     val updated = songs.map { it.copy(isFavorite = it.id in favIds) }
                     copy(songs = updated, filteredSongs = searchSongsUseCase(updated, searchQuery))
                 }
+                // NEW: keep the currently-playing song's favourite flag in sync too
+                mutatePlayer {
+                    val cur = playbackState.currentSong
+                    if (cur != null) {
+                        copy(playbackState = playbackState.copy(
+                            currentSong = cur.copy(isFavorite = cur.id in favIds)
+                        ))
+                    } else this
+                }
             }
         }
     }
@@ -278,6 +288,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
      * us of an audio MediaStore mutation (new download, deleted file, tag edit).
      * We debounce with a 2-second window to avoid redundant scans on burst writes.
      */
+    @OptIn(FlowPreview::class)
     private fun observeMediaStore() {
         mediaStoreJob?.cancel()
         mediaStoreJob = viewModelScope.launch {

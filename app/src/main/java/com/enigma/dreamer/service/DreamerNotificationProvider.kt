@@ -41,6 +41,8 @@ import java.util.concurrent.atomic.AtomicInteger
  * handles foreground/ongoing state, and stays in sync with Media3 releases.
  * Rolling our own means duplicating that logic forever.
  */
+
+/**
 @OptIn(UnstableApi::class)
 class DreamerNotificationProvider(
     private val context: Context,
@@ -117,6 +119,24 @@ class DreamerNotificationProvider(
     companion object {
         // Stable notification ID used for the foreground service notification.
         // AtomicInteger lets us change it in future without data races.
+        private val NOTIF_ID = AtomicInteger(1001)
+    }
+}
+*/
+
+
+
+@OptIn(UnstableApi::class)
+class DreamerNotificationProvider(
+    context: Context,
+    channelId: String
+) : DefaultMediaNotificationProvider(
+    context,
+    { NOTIF_ID.get() },
+    channelId,
+    com.enigma.dreamer.R.string.notification_channel_name
+) {
+    companion object {
         private val NOTIF_ID = AtomicInteger(1001)
     }
 }

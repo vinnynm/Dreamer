@@ -262,7 +262,7 @@ class MusicService : MediaLibraryService() {
                 val bmp = albumArtBitmap
                 albumArtBitmap = null
                 bmp?.recycle()
-                notificationProvider.setAccentColor(COLOR_DEFAULT)
+               // notificationProvider.setAccentColor(COLOR_DEFAULT)
                 pushWidgetUpdate()
                 persistState()
             }
@@ -332,7 +332,7 @@ class MusicService : MediaLibraryService() {
             buildShuffledQueue(queue, idx) else queue
         val effectiveIdx = if (ps.shuffleMode == ShuffleMode.ON) 0 else idx
 
-        loadQueueIntoPlayer(effectiveQueue, effectiveIdx)
+        loadQueueIntoPlayer(effectiveQueue, effectiveIdx,playWhenReady = true)
         _playbackState.value = ps.copy(
             queue       = effectiveQueue,
             queueIndex  = effectiveIdx,
@@ -441,7 +441,7 @@ class MusicService : MediaLibraryService() {
     }
 
     fun updateAlbumArt(bitmap: Bitmap?, accentColor: Int) {
-        notificationProvider.setAccentColor(accentColor)
+       // notificationProvider.setAccentColor(accentColor)
         if (bitmap == null) return
 
         val scaled = scaleBitmap(bitmap, 256)
@@ -607,11 +607,15 @@ class MusicService : MediaLibraryService() {
         return listOf(current) + (source - current).shuffled()
     }
 
-    private fun loadQueueIntoPlayer(queue: List<Song>, startIndex: Int) {
+    private fun loadQueueIntoPlayer(
+        queue: List<Song>,
+        startIndex: Int,
+        playWhenReady: Boolean = false   // NEW
+    ) {
         player.setMediaItems(queue.map { it.toMediaItem() }, startIndex, C.TIME_UNSET)
+        player.playWhenReady = playWhenReady   // NEW
         player.prepare()
     }
-
     private fun buildTapIntent(): PendingIntent {
         val intent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
